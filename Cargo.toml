@@ -1,0 +1,30 @@
+[package]
+name = "ds3sm"
+version = "0.1.0"
+edition = "2024"
+description = "DS3SessionManager: real-time connection telemetry for Dark Souls III peer-to-peer sessions"
+license = "MIT"
+repository = "https://github.com/SeriouslyCasual/DS3SessionManager"
+publish = false
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.6", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+csv = "1.4"
+sha2 = "0.11"
+rusqlite = { version = "0.42", features = ["bundled"] }
+steamworks-sys = "0.13"
+maxminddb = "0.32"
+ctrlc = "3"
+
+[target.'cfg(windows)'.dependencies]
+ferrisetw = "1.2"
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_UI_Shell",
+] }
+
+[profile.release]
+debug = 1

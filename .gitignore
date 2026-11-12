@@ -1,0 +1,51 @@
+# Rust
+/target/
+
+# Local run data: may contain raw peer IPs and Steam IDs. Never commit.
+/runs/
+*.sqlite
+*.sqlite3
+*.db
+*.pcap
+*.pcapng
+*.etl
+
+# Raw (non-anonymized) experiment data
+experiments/raw/
+
+# GeoIP databases (downloaded locally; licence requires attribution, size is large)
+/geo/*.csv
+/geo/*.mmdb
+/geo/*.gz
+
+# Steam runtime files generated next to the binary
+steam_appid.txt
+steam_api64.dll
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# LaTeX build output
+report/*.aux
+report/*.bbl
+report/*.blg
+report/*.log
+report/*.out
+report/*.fdb_latexmk
+report/*.fls
+report/*.synctex.gz
+report/*.pdf
+
+# Editors / OS
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
+
+# mdBook output
+/docs/book/
+
+# Local-only files (never pushed)
+/private/
