@@ -1,0 +1,21 @@
+# Format, lint and test the Rust code on every push and pull request.
+name: CI
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ["docs/**", "report/**", "*.md"]
+  pull_request:
+
+jobs:
+  rust:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --locked
