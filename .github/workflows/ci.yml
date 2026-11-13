@@ -4,7 +4,7 @@ name: CI
 on:
   push:
     branches: [main]
-    paths-ignore: ["docs/**", "report/**", "*.md"]
+    paths-ignore: ["docs/**", "*.md"]
   pull_request:
 
 jobs:
