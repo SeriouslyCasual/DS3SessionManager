@@ -1,22 +1,37 @@
-//! Steamworks access: peer discovery and per-peer P2P session state.
+//! Steamworks access: who we're connected to, and the state of each connection.
 //!
-//! Technique (documented by DS3ConnectionInfo and reimplemented here):
-//! 1. Initialise the Steam API in **this** process with Dark Souls III's AppID
-//!    (374320).
-//! 2. Enumerate Steam's "coplay" list (recently played with) via
-//!    `ISteamFriends::GetCoplayFriend`.
-//! 3. Ask `ISteamNetworking::GetP2PSessionState` (the deprecated, pre-SDR P2P
-//!    API) about each candidate. Peers with an active or connecting session
-//!    are the game's current P2P peers.
+//! # Technique
 //!
-//! Why a second process sees the game's sessions is not documented by Valve;
-//! it is an empirical property checked in experiment E1.
+//! (Documented by DS3ConnectionInfo; reimplemented here, no code copied.)
+//! 1. Initialise the Steam API in **this** process using Dark Souls III's AppID
+//!    (374320), so Steam treats us as part of the running game.
+//! 2. List Steam's "coplay" list ("recently played with") via
+//!    `ISteamFriends::GetCoplayFriend`. DS3 adds players there when you meet
+//!    them.
+//! 3. Ask `ISteamNetworking::GetP2PSessionState` (Steam's older P2P API,
+//!    which DS3 uses) about each candidate. Players with an active or
+//!    connecting session are the game's current peers.
 //!
-//! Footprint: this module never touches the game process. It talks only to
-//! the local Steam client over Steam's own IPC.
+//! Why can a *second* program see the game's sessions? Valve doesn't document
+//! it. Both programs talk to the same Steam client under the same AppID, and
+//! Steam appears to share session state between them. It's an observed
+//! behaviour, which the project's first experiment checks.
 //!
-//! All `unsafe` here is plain FFI into the Steamworks flat C API. Pointers
-//! are checked for null, and strings are copied out immediately.
+//! Footprint: this module never touches the game process. It only talks to
+//! the local Steam client through Steam's own library.
+//!
+//! # Rust concepts: FFI and `unsafe`
+//!
+//! Steam's library (`steam_api64.dll`) has a C interface. Calling C from Rust
+//! is called **FFI** (Foreign Function Interface). The `steamworks-sys` crate
+//! contains auto-generated Rust *declarations* of Steam's C functions, which
+//! we import as `sys`.
+//!
+//! The compiler can't verify what C code does with pointers, so every call is
+//! wrapped in `unsafe { ... }`. That's us promising the rules are followed,
+//! and each block has a `// SAFETY:` comment saying why. `*mut T` is a *raw
+//! pointer*: unlike `&T`, it can be null, it isn't checked by the borrow
+//! checker, and using it requires `unsafe`.
 
 use crate::model::{P2PState, SteamId};
 use anyhow::{Result, bail};
@@ -25,6 +40,7 @@ use std::ffi::CStr;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use steamworks_sys as sys;
 
+/// Dark Souls III's Steam application ID.
 pub const DS3_APP_ID: u32 = 374320;
 
 /// Sets the environment variables Steam reads to pick the AppID.
@@ -41,15 +57,31 @@ pub unsafe fn set_app_id_env(app_id: u32) {
     }
 }
 
+/// A live connection to the Steam client.
+///
+/// It holds the three Steam "interface" pointers we use. `Steam` is created
+/// by `init()` and shuts the API down in `Drop`. Raw pointers are neither
+/// `Send` nor `Sync`, so the compiler automatically stops this struct from
+/// being moved to another thread. That suits Steam, which expects calls
+/// from one thread.
 pub struct Steam {
     friends: *mut sys::ISteamFriends,
     networking: *mut sys::ISteamNetworking,
     user: *mut sys::ISteamUser,
+    // Steam IDs whose names we've already asked Steam to fetch, so we ask once.
     requested_names: HashSet<u64>,
 }
 
 impl Steam {
     /// Initialise the Steam API. Call [`set_app_id_env`] first.
+    // Steps:
+    //   1. `SteamAPI_InitFlat` connects to the running Steam client. On failure,
+    //      Steam writes a C string (bytes ending in 0) into our 1024-byte buffer.
+    //      `CStr::from_ptr` reads up to that 0, and `to_string_lossy` turns it into
+    //      Rust text.
+    //   2. Fetch the interface pointers (the `_v018` suffixes are API versions).
+    //   3. Check none are null before storing them. Never trust a C pointer blindly.
+    // `bail!` (from anyhow) means "return this error now".
     pub fn init() -> Result<Self> {
         let mut err: sys::SteamErrMsg = [0; 1024];
         // SAFETY: FFI call with a valid, writable 1024-byte error buffer.
@@ -81,6 +113,8 @@ impl Steam {
     }
 
     /// Pump Steam callbacks (fills the persona-name cache).
+    // Steam answers some requests asynchronously (e.g. a player's name arriving
+    // later). Calling RunCallbacks regularly lets those answers be processed.
     pub fn run_callbacks(&self) {
         // SAFETY: Steam is initialised for the lifetime of `self`.
         unsafe { sys::SteamAPI_RunCallbacks() };
@@ -92,6 +126,9 @@ impl Steam {
     }
 
     /// All players on the coplay list (any game, any age).
+    // Steam exposes the list as "count" + "get item i". `.max(0)` guards
+    // against a negative count, then `(0..n).map(...).collect()` builds a Vec by
+    // calling GetCoplayFriend for each index.
     pub fn coplay_list(&self) -> Vec<SteamId> {
         // SAFETY: `friends` is a valid interface pointer.
         let n = unsafe { sys::SteamAPI_ISteamFriends_GetCoplayFriendCount(self.friends) };
@@ -105,6 +142,15 @@ impl Steam {
 
     /// `GetP2PSessionState` for one peer. `None` means Steam has no session
     /// with that peer for this AppID.
+    // Steps:
+    //   1. Make a zeroed `P2PSessionState_t` for Steam to fill in.
+    //      `std::mem::zeroed()` is unsafe in general, but fine for a plain C struct
+    //      of integers.
+    //   2. Pass a pointer to it (`&mut st` coerces to `*mut`). `false` means
+    //      "no session with this player".
+    //   3. Convert into our friendlier `P2PState`: `u8` flags become `bool`, and
+    //      an IP of 0 becomes `None` via `bool::then`, which gives `Some(...)` only
+    //      if the condition is true.
     pub fn p2p_state(&self, id: SteamId) -> Option<P2PState> {
         // SAFETY: P2PSessionState_t is plain old data; zero is a valid value.
         let mut st: sys::P2PSessionState_t = unsafe { std::mem::zeroed() };
@@ -131,6 +177,9 @@ impl Steam {
     }
 
     /// Coplay peers that currently have an active or connecting P2P session.
+    // An iterator chain reads like a sentence:
+    //   coplay list → not me → that has a session (filter_map keeps the Somes,
+    //   pairing id with state) → that's live → collect into a Vec.
     pub fn active_peers(&self) -> Vec<(SteamId, P2PState)> {
         let me = self.local_id();
         self.coplay_list()
@@ -143,6 +192,10 @@ impl Steam {
 
     /// Persona name if Steam has it cached. Asks Steam to fetch it otherwise
     /// (the name shows up on a later poll once callbacks have run).
+    // Steam returns "[unknown]" (or an empty string) until it has the name
+    // cached. In that case we ask once with RequestUserInformation; a later poll
+    // will find the name. `HashSet::insert` returns true only the first time an
+    // item is added, which is a neat "do this once" check.
     pub fn persona(&mut self, id: SteamId) -> Option<String> {
         // SAFETY: valid interface pointer; Steam returns a NUL-terminated
         // UTF-8 string owned by Steam, which we copy immediately.
@@ -165,6 +218,9 @@ impl Steam {
     }
 }
 
+// `Drop` is Rust's destructor: it runs automatically when a `Steam` value goes
+// out of scope, even if the function exits early with an error. So Steam is
+// always shut down cleanly.
 impl Drop for Steam {
     fn drop(&mut self) {
         // SAFETY: Steam was initialised by `init`.

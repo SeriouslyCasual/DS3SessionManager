@@ -1,9 +1,29 @@
 //! Per-run SQLite logging and anonymized CSV export.
 //!
+//! # Why SQLite?
+//!
+//! SQLite is a whole database in a single file: no server to install, safe
+//! against crashes, and easy to query later from Python (`sqlite3`, `pandas`)
+//! to make graphs. The `rusqlite` crate wraps it. With its `bundled` feature,
+//! SQLite itself is compiled into our program, so users need nothing extra.
+//!
+//! # Privacy
+//!
 //! Each `monitor` run writes one database under `runs/` (git-ignored). The
-//! database holds raw identifiers because the live tool needs them. Only
-//! `export` output (pseudonymized, /24-truncated) belongs in
-//! `experiments/data/`.
+//! database holds raw identifiers (Steam IDs, IPs) because the live tool needs
+//! them, so it stays on the user's PC. Only `export` output (pseudonymized,
+//! /24-truncated, distance-rounded) is meant to be shared.
+//!
+//! # Tables
+//!
+//! | table       | one row per…                                   |
+//! |-------------|------------------------------------------------|
+//! | `meta`      | key/value fact about the run (version, label)  |
+//! | `peer`      | Steam ID seen (name, first and last seen)      |
+//! | `p2p_state` | *change* in a peer's Steam session state       |
+//! | `rtt`       | RTT sample                                     |
+//! | `geo`       | peer's estimated location                      |
+//! | `event`     | notable happening (game restarted, peer left)  |
 
 use crate::anon;
 use crate::model::{P2PState, RttSample, SteamId};
@@ -12,6 +32,11 @@ use rusqlite::{Connection, params};
 use std::net::Ipv4Addr;
 use std::path::Path;
 
+// The database layout, run once when the file is opened.
+// `r#"..."#` is a *raw string literal*: backslashes and quotes inside need no
+// escaping, which is handy for SQL. `IF NOT EXISTS` makes it safe to run on
+// an existing file. `PRAGMA journal_mode = WAL` turns on write-ahead logging,
+// which survives crashes well and lets readers work while we write.
 const SCHEMA: &str = r#"
 PRAGMA journal_mode = WAL;
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -60,11 +85,21 @@ CREATE INDEX IF NOT EXISTS rtt_by_peer ON rtt (steam_id, t_ns);
 CREATE INDEX IF NOT EXISTS state_by_peer ON p2p_state (steam_id, t_ns);
 "#;
 
+/// An open run database.
+///
+/// It owns one `rusqlite::Connection`. When the `Store` is dropped (goes out
+/// of scope), the connection closes automatically. That's Rust's RAII
+/// pattern, so there's no explicit `close()` to forget.
 pub struct Store {
     conn: Connection,
 }
 
 /// Geographic fields stored for a peer.
+// `GeoRow<'a>` has a *lifetime parameter*. Its `&'a str` fields borrow text
+// that lives somewhere else (in the caller's `GeoInfo`) instead of copying it.
+// The `'a` tells the compiler a `GeoRow` must not outlive the data it
+// borrows. This struct is only used briefly to pass arguments, so borrowing
+// avoids needless allocation.
 pub struct GeoRow<'a> {
     pub country: Option<&'a str>,
     pub city: Option<&'a str>,
@@ -76,6 +111,11 @@ pub struct GeoRow<'a> {
 }
 
 impl Store {
+    /// Open (or create) the database at `path` and make sure the tables exist.
+    ///
+    /// Steps: create the parent folder if needed → open the file → run the schema.
+    /// `if let Some(dir) = path.parent()` only runs the block when the path
+    /// actually has a parent folder.
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
@@ -86,6 +126,12 @@ impl Store {
         Ok(Self { conn })
     }
 
+    /// Store one key/value fact about the run.
+    ///
+    /// "Upsert" = insert, or update if the key already exists
+    /// (`ON CONFLICT ... DO UPDATE`). `?1`, `?2` are *placeholders*: values are
+    /// passed separately via `params![]`, never glued into the SQL text. This
+    /// prevents SQL injection and quoting bugs. Always do it this way.
     pub fn set_meta(&self, key: &str, value: &str) -> Result<()> {
         self.conn.execute(
             "INSERT INTO meta (key, value) VALUES (?1, ?2)
@@ -95,6 +141,12 @@ impl Store {
         Ok(())
     }
 
+    /// Record that we saw a peer at time `t_ns`.
+    ///
+    /// `COALESCE(excluded.persona, peer.persona)` keeps a previously known name
+    /// if this time we only have `NULL` (Steam hadn't sent the name yet).
+    /// SQLite stores integers as signed 64-bit, so `u64`/`i128` values are cast
+    /// with `as i64`. Steam IDs and current timestamps fit comfortably.
     pub fn upsert_peer(&self, id: SteamId, persona: Option<&str>, t_ns: i128) -> Result<()> {
         let t = t_ns as i64;
         self.conn.execute(
@@ -108,6 +160,11 @@ impl Store {
         Ok(())
     }
 
+    /// Append one `p2p_state` row. The monitor only calls this when the state
+    /// actually changed, which keeps the file small.
+    ///
+    /// `s.remote.map(|a| a.ip().to_string())` turns `Option<SocketAddrV4>` into
+    /// `Option<String>`. rusqlite stores `None` as SQL `NULL`.
     pub fn insert_state(&self, t_ns: i128, id: SteamId, s: &P2PState) -> Result<()> {
         self.conn.execute(
             "INSERT INTO p2p_state VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
@@ -127,6 +184,8 @@ impl Store {
         Ok(())
     }
 
+    /// Append one RTT sample. `id` is `Option` because ETW can time a packet to an
+    /// endpoint that Steam hasn't (yet) told us belongs to a peer.
     pub fn insert_rtt(
         &self,
         id: Option<SteamId>,
@@ -147,6 +206,7 @@ impl Store {
         Ok(())
     }
 
+    /// Store (or replace) a peer's location estimate.
     pub fn upsert_geo(&self, id: SteamId, g: &GeoRow<'_>) -> Result<()> {
         self.conn.execute(
             "INSERT OR REPLACE INTO geo VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
@@ -164,6 +224,7 @@ impl Store {
         Ok(())
     }
 
+    /// Append a free-form event (e.g. "game_pid", "peer_left", "stop").
     pub fn event(&self, t_ns: i128, kind: &str, detail: &str) -> Result<()> {
         self.conn.execute(
             "INSERT INTO event VALUES (?1, ?2, ?3)",
@@ -173,6 +234,13 @@ impl Store {
     }
 
     /// Write anonymized CSVs (`rtt.csv`, `state.csv`, `peers.csv`) into `out_dir`.
+    // Export works the same way for all three files:
+    //   1. create a CSV writer and write the header row;
+    //   2. `prepare` a SELECT, then loop over the rows with `while let Some(r)`;
+    //   3. replace identifiers (pseudonym, /24 network) before writing each row;
+    //   4. `flush()` so everything reaches the disk.
+    // `r.get::<_, i64>(2)?` reads column 2 as an `i64`. The `_` lets the compiler
+    // infer the index type.
     pub fn export_anonymized(&self, out_dir: &Path, salt: &str, run_label: &str) -> Result<()> {
         std::fs::create_dir_all(out_dir)?;
 
@@ -271,12 +339,18 @@ impl Store {
     }
 }
 
+/// Convert a stored IP string into its /24 network, or "?" if it doesn't parse.
+/// `.parse::<Ipv4Addr>()` uses the standard library's `FromStr` for addresses.
 fn net_of(ip: &str) -> String {
     ip.parse::<Ipv4Addr>()
         .map(anon::ip_prefix24)
         .unwrap_or_else(|_| "?".into())
 }
 
+// ---------------------------------------------------------------------------
+// Unit test: privacy guarantees deserve tests too. Build a tiny database with
+// a known Steam ID, IP and name, export it, and check none of them leak.
+// ---------------------------------------------------------------------------
 #[cfg(test)]
 mod tests {
     use super::*;

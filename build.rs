@@ -1,13 +1,35 @@
-//! Copies `steam_api64.dll` (shipped inside the `steamworks-sys` crate) next to
-//! the built executable, so `cargo run` works without manual copying.
+//! Build script: copies `steam_api64.dll` next to the built executable.
 //!
-//! Note: Dark Souls III's own `steam_api64.dll` is too old (it predates the
-//! flat API), so the SDK copy is required.
+//! # What a build script is
+//!
+//! If a crate has a `build.rs`, Cargo compiles and runs it **before**
+//! compiling the crate itself. Build scripts can generate code, compile C
+//! libraries, or (as here) prepare files. They talk to Cargo by printing lines
+//! that start with `cargo:`, such as `cargo:warning=...` or
+//! `cargo:rerun-if-changed=...`.
+//!
+//! # Why we need one
+//!
+//! `steamworks-sys` links our program against `steam_api64.dll`, and Windows
+//! looks for that DLL **next to the .exe** when the program starts. If it's
+//! missing, the program can't even launch. The game folder has its own copy,
+//! but it dates from 2016 and lacks the "flat" API functions we call, so we
+//! use the copy from the Steamworks SDK bundled inside the `steamworks-sys`
+//! crate.
 
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+// Steps:
+//   1. Only rerun this script when build.rs itself changes (saves time).
+//   2. Do nothing on non-Windows targets.
+//   3. Work out target/<profile>/ from OUT_DIR, which Cargo sets to
+//      target/<profile>/build/ds3sm-<hash>/out (three folders deeper).
+//   4. Find the DLL and copy it there, and into deps/ where `cargo test`
+//      runs from.
+// `let Some(x) = ... else { return; };` is *let-else*: continue with `x` if the
+// pattern matches, otherwise leave the function.
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     if env::var("CARGO_CFG_WINDOWS").is_err() {
@@ -42,6 +64,10 @@ fn main() {
 }
 
 /// Look in the cargo registry sources for steamworks-sys's redistributable.
+// Cargo downloads crate sources into $CARGO_HOME/registry/src/<index>/<crate>-<version>/.
+// We search there for steamworks-sys and pick the 0.13.x copy (the version our
+// Cargo.toml asks for), falling back to the newest found. `?` on an `Option`
+// returns `None` early if a folder can't be read.
 fn find_dll() -> Option<PathBuf> {
     let cargo_home = env::var_os("CARGO_HOME")
         .map(PathBuf::from)

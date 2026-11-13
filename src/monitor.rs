@@ -1,5 +1,21 @@
-//! The `probe` and `monitor` commands: Steam session state + ETW RTT + GeoIP,
-//! displayed live and logged to SQLite.
+//! The `probe` and `monitor` commands: the glue that combines Steam session
+//! state, ETW packet timing and GeoIP into a live table, logged to SQLite.
+//!
+//! # Data flow
+//!
+//! ```text
+//!   Steam (steam.rs) ──► who, relay?, remote IP:port ─┐
+//!                                                     ├─► join on IP:port ─► table + SQLite
+//!   ETW (etw.rs) ──► packets ──► stun.rs ──► RTT ─────┘
+//!                                    GeoIP (geo.rs) ──► country, distance, bound
+//! ```
+//!
+//! # Structure
+//!
+//! `run()` owns all the state (maps, matcher, database). Helper functions
+//! *borrow* just the pieces they need: `&mut` for what they change, `&` for
+//! what they only read. A helper's signature therefore tells you exactly what
+//! it can touch.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddrV4};
@@ -20,6 +36,9 @@ use crate::store::{GeoRow, Store};
 use crate::stun::{Direction, StunConfig, StunMatcher};
 use crate::win;
 
+/// Current wall-clock time in Unix nanoseconds. If the clock is somehow
+/// before 1970, `duration_since` fails and we fall back to 0 rather than
+/// crashing.
 fn now_ns() -> i128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -27,6 +46,9 @@ fn now_ns() -> i128 {
         .unwrap_or(0)
 }
 
+/// `ds3sm probe`: check each prerequisite in turn and print what was found.
+/// Every check reports its own failure instead of stopping the whole command,
+/// so one run shows everything that needs fixing.
 pub fn probe(geo_path: &Path) -> Result<()> {
     println!("ds3sm probe");
     println!("  administrator:  {}", win::is_admin());
@@ -73,6 +95,9 @@ pub fn probe(geo_path: &Path) -> Result<()> {
 
 /// Per-remote-endpoint traffic counters (all packet sizes, not just STUN).
 #[derive(Default, Clone, Copy)]
+// Plain counters per remote endpoint, updated for every packet of the game's.
+// `#[derive(Default)]` makes `Traffic::default()` all zeros, which lets the
+// entry API create it on first sight (`.or_default()`).
 struct Traffic {
     pkts_out: u64,
     pkts_in: u64,
@@ -83,6 +108,7 @@ struct Traffic {
     max_gap_in_ns: i128,
 }
 
+/// Everything the monitor remembers about one peer between polls.
 struct PeerView {
     persona: Option<String>,
     state: P2PState,
@@ -93,7 +119,21 @@ struct PeerView {
     last_logged_state: Option<P2PState>,
 }
 
+// ===========================================================================
+// `ds3sm monitor`
+// ===========================================================================
+// Startup steps:
+//   1. Ctrl+C handler: set a shared flag instead of killing the process, so
+//      the loop can finish cleanly and record a final "stop" event.
+//   2. Open the run database and record metadata (version, label, settings).
+//   3. Open the GeoIP database (optional: warn and carry on without it).
+//   4. Wait for the game to start (no handle to the game is ever opened).
+//   5. Connect to Steam.
+//   6. Start ETW, calibrate the byte order, tell the trace which PID to watch.
+//   7. Loop until Ctrl+C (see the numbered steps inside the loop).
 pub fn run(args: MonitorArgs) -> Result<()> {
+    // Step 1. The inner `{ }` block lets us shadow `stop` with a clone that
+    // moves into the handler closure, while the outer `stop` stays usable here.
     let stop = Arc::new(AtomicBool::new(false));
     {
         let stop = Arc::clone(&stop);
@@ -101,6 +141,9 @@ pub fn run(args: MonitorArgs) -> Result<()> {
             .context("installing Ctrl+C handler")?;
     }
 
+    // Step 2. `unwrap_or_else` only builds the default path when `--db` wasn't
+    // given. `env!("CARGO_PKG_VERSION")` is filled in at compile time from
+    // Cargo.toml.
     let db_path = args
         .db
         .clone()
@@ -112,6 +155,7 @@ pub fn run(args: MonitorArgs) -> Result<()> {
     store.set_meta("req_size", &args.req_size.to_string())?;
     store.set_meta("reply_size", &args.reply_size.to_string())?;
 
+    // Step 3. `{e:#}` prints the error together with its context chain.
     let geodb = match GeoDb::open(&args.geo) {
         Ok(g) => Some(g),
         Err(e) => {
@@ -124,6 +168,8 @@ pub fn run(args: MonitorArgs) -> Result<()> {
         _ => None,
     };
 
+    // Step 4. `loop` with `break value` makes the loop itself an expression
+    // that produces the PID.
     println!("waiting for {} ...", win::DS3_EXE);
     let mut game_pid = loop {
         if stop.load(Ordering::SeqCst) {
@@ -136,9 +182,12 @@ pub fn run(args: MonitorArgs) -> Result<()> {
     };
     store.event(now_ns(), "game_pid", &game_pid.to_string())?;
 
+    // Step 5.
     let mut steam = Steam::init()?;
     store.set_meta("local_steam_id", &steam.local_id().to_string())?;
 
+    // Step 6. Both branches of the `if` produce a tuple of two `Option`s, so
+    // `--no-etw` simply leaves both as `None`.
     let (trace, byte_order) = if args.no_etw {
         (None, None)
     } else {
@@ -149,6 +198,12 @@ pub fn run(args: MonitorArgs) -> Result<()> {
         (Some(t), Some(bo))
     };
 
+    // Loop state. The maps are keyed so we can join Steam's view and ETW's view:
+    //   peers:       SteamId  → what we know about that player
+    //   by_endpoint: IP:port  → SteamId (filled from Steam, read when ETW
+    //                gives us an RTT for an endpoint)
+    //   traffic:     IP:port  → packet counters (prev_traffic = last poll's
+    //                copy, used to compute packets/second)
     let mut matcher = StunMatcher::new(StunConfig {
         request_size: args.req_size,
         reply_size: args.reply_size,
@@ -162,6 +217,11 @@ pub fn run(args: MonitorArgs) -> Result<()> {
     let mut next_poll = Instant::now();
     let mut last_pid_check = Instant::now();
 
+    // Main loop. ETW events are drained every ~10 ms, but Steam is polled and
+    // the table redrawn only every `interval` (default 500 ms). Packet
+    // timestamps are taken by the kernel, so draining late never distorts
+    // RTT. Steam state changes slowly, so polling it often would be wasted
+    // work.
     while !stop.load(Ordering::SeqCst) {
         // 1. Drain ETW events.
         if let (Some(t), Some(bo)) = (&trace, byte_order) {
@@ -209,6 +269,12 @@ pub fn run(args: MonitorArgs) -> Result<()> {
         // 3. Poll Steam.
         steam.run_callbacks();
         let t = now_ns();
+        // For each live peer: fetch the name, record that we saw them, update
+        // the in-memory view, log the state only if it changed, remember which
+        // endpoint belongs to them, and geolocate once. We skip relayed peers,
+        // because a relay's IP says nothing about where the player is.
+        // `or_insert_with(|| ...)` only builds the default `PeerView` when
+        // the peer is new.
         let active = steam.active_peers();
         for (id, st) in &active {
             let persona = steam.persona(*id);
@@ -237,10 +303,11 @@ pub fn run(args: MonitorArgs) -> Result<()> {
                 }
             }
         }
+        // `current` = the Steam IDs that are live right now.
         // Peers that left: log a final inactive state once.
         let current: Vec<SteamId> = active.iter().map(|(id, _)| *id).collect();
         for (id, view) in peers.iter_mut() {
-            if !current.contains(id) && view.state.active {
+            if !current.contains(id) && (view.state.active || view.state.connecting) {
                 view.state.active = false;
                 view.state.connecting = false;
                 store.insert_state(t, *id, &view.state)?;
@@ -269,6 +336,13 @@ pub fn run(args: MonitorArgs) -> Result<()> {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Process every ETW event waiting in the channel (non-blocking).
+///
+/// `try_recv()` returns immediately: `Ok(event)` if one is queued, `Err` when
+/// the queue is empty, which ends the `while let` loop. For each event:
+/// decode it with the calibrated byte order, update packet counters, feed the
+/// STUN matcher, and if that completes an RTT sample, store it and add it
+/// to the peer's rolling statistics.
 fn drain_etw(
     t: &etw::UdpTrace,
     bo: ByteOrder,
@@ -315,6 +389,11 @@ fn drain_etw(
     Ok(())
 }
 
+/// Look up a peer's location once and store it, computing the distance and
+/// speed-of-light bound if the user gave their own coordinates. Private and
+/// LAN addresses are skipped (GeoIP can't place them).
+/// `let Some(db) = geodb else { return Ok(()) };` is *let-else*: bind the
+/// value if present, otherwise leave the function early.
 fn locate(
     view: &mut PeerView,
     id: SteamId,
@@ -351,12 +430,23 @@ fn locate(
     Ok(())
 }
 
+/// Format an optional number with `prec` decimals, or "-" when unknown.
+/// `{x:.prec$}` takes the precision from the variable `prec`.
 fn opt(v: Option<f64>, prec: usize) -> String {
     v.map(|x| format!("{x:.prec$}"))
         .unwrap_or_else(|| "-".into())
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Redraw the live table.
+///
+/// The whole screen is built into one `String` and printed at once, which
+/// avoids flicker. `\x1b[2J\x1b[H` is the ANSI escape sequence for "clear
+/// screen, move cursor to top-left".
+///
+/// Below the peer table it lists "unattributed" endpoints: addresses the game
+/// exchanges packets with that no Steam session claims (relays, matchmaking
+/// servers, or peers missing from the coplay list).
 fn draw(
     peers: &HashMap<SteamId, PeerView>,
     current: &[SteamId],
