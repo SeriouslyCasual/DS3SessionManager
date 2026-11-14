@@ -48,7 +48,7 @@ mod steam; // talks to the local Steam client
 #[cfg(windows)]
 mod win; // find the game process, check admin rights
 
-// `use` brings names into scope so we can write `Result` instead of
+// `use` brings names into scope so the code can write `Result` instead of
 // `anyhow::Result`.
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -57,7 +57,7 @@ use std::path::PathBuf;
 // ---------------------------------------------------------------------------
 // Command-line definition
 // ---------------------------------------------------------------------------
-// `clap`'s *derive* API: we describe the CLI as ordinary structs and enums,
+// `clap`'s *derive* API: the CLI is described as ordinary structs and enums,
 // and `#[derive(Parser)]` generates all the parsing code, `--help` text and
 // error messages at compile time. The `///` doc comment on each field becomes
 // that field's help text, so those comments are written for end users.
@@ -84,7 +84,7 @@ struct Cli {
 #[derive(clap::Args, Clone, Debug)]
 pub struct MonitorArgs {
     /// SQLite file for this run (default: runs/UNIX-TIME.sqlite).
-    // `Option<PathBuf>`: the flag is optional. clap gives us `None` if absent.
+    // `Option<PathBuf>`: the flag is optional. clap gives `None` if absent.
     #[arg(long)]
     pub db: Option<PathBuf>,
     /// GeoIP MMDB file (DB-IP City Lite). Skipped if missing.
@@ -159,9 +159,9 @@ enum Cmd {
 ///
 /// Returning `Result<()>` means any error that bubbles up with `?` ends the
 /// program with a non-zero exit code and prints the error chain. That gives
-/// us readable failures without writing explicit error printing.
+/// readable failures without writing explicit error printing.
 fn main() -> Result<()> {
-    // Step 1 (Windows only): tell the Steam library which game we are, by
+    // Step 1 (Windows only): tell the Steam library which game this is, by
     // setting environment variables. This must happen before any thread is
     // started, which is why it's the very first statement. See
     // `steam::set_app_id_env` for why it's `unsafe`.
@@ -172,7 +172,7 @@ fn main() -> Result<()> {
     }
 
     // Step 2: parse the command line. On `--help` or a bad flag, clap prints a
-    // message and exits the process for us.
+    // message and exits the process automatically.
     let cli = Cli::parse();
 
     // Step 3: dispatch. `match` must cover every variant, and the compiler

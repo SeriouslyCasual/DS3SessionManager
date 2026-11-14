@@ -2,7 +2,7 @@
 //!
 //! # The networking idea
 //!
-//! A single ping sample is noisy, so we keep a sliding window of the last N
+//! A single ping sample is noisy, so the code keeps a sliding window of the last N
 //! samples and summarise it:
 //! - **median**: the typical RTT, unaffected by one-off spikes;
 //! - **p95**: the 95th percentile, "how bad does it get". Lag spikes live in
@@ -58,7 +58,7 @@ impl Rolling {
     ///
     /// `Self` is shorthand for the type being implemented (`Rolling`).
     /// `assert!` panics (crashes with a message) if the condition is false.
-    /// We use it for programmer mistakes like a zero-size window, not for
+    /// It's used for programmer mistakes like a zero-size window, not for
     /// bad user input.
     pub fn new(cap: usize) -> Self {
         assert!(cap > 0, "window must be non-empty");
@@ -90,7 +90,7 @@ impl Rolling {
         }
 
         // Step 1: copy the window into a plain `Vec` (contiguous memory) so
-        // we can use slice helpers like `windows()`. `.iter()` yields `&f64`;
+        // slice helpers can be used like `windows()`. `.iter()` yields `&f64`;
         // `.copied()` turns each into an `f64`; `.collect()` builds the Vec.
         let v: Vec<f64> = self.buf.iter().copied().collect();
 
@@ -111,7 +111,7 @@ impl Rolling {
 
         // Step 4: percentiles need sorted data. Floats can be NaN, so `f64`
         // has no total order (it isn't `Ord`) and `.sort()` won't compile.
-        // `total_cmp` defines an order that includes NaN, so we sort with it.
+        // `total_cmp` defines an order that includes NaN, so sorting uses it.
         let mut sorted = v.clone();
         sorted.sort_by(|a, b| a.total_cmp(b));
 

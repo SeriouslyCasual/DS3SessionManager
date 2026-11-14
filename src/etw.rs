@@ -8,17 +8,17 @@
 //! TCP/IP provider (`EVENT_TRACE_FLAG_NETWORK_TCPIP`) emits a `UdpIp` event for
 //! **every UDP packet** the PC sends or receives. Each event carries the
 //! process ID, payload size, both IP addresses and ports, and a precise
-//! timestamp, but **not** the packet contents. That's exactly what we need
+//! timestamp, but **not** the packet contents. That's exactly what's needed
 //! to time Steam's connectivity checks (see `stun.rs`).
 //!
 //! On Windows 8 and later, the `ferrisetw` crate starts the session in "system
-//! logger" mode with its own name, so we don't take over Windows' single
+//! logger" mode with its own name, so it doesn't take over Windows' single
 //! classic "NT Kernel Logger" session that other tools may be using.
 //!
 //! # Timestamps
 //!
 //! ferrisetw sets the session clock to the high-resolution QPC timer, and ETW
-//! hands us FILETIME values (100-ns ticks since 1601-01-01), which we convert
+//! delivers FILETIME values (100-ns ticks since 1601-01-01), which are converted
 //! to Unix nanoseconds.
 //!
 //! # Byte-order self-calibration
@@ -30,7 +30,7 @@
 //!
 //! # Rust concepts: threads, closures, channels, atomics
 //!
-//! ferrisetw calls our closure **on its own background thread**, once per
+//! ferrisetw calls the program's closure **on its own background thread**, once per
 //! event. Events travel to the main thread through a *channel* (a thread-safe
 //! queue). The game's PID travels the other way through an *atomic* integer
 //! shared with `Arc`. See `start()` for the details.
@@ -65,7 +65,7 @@ const FILETIME_UNIX_EPOCH: i64 = 116_444_736_000_000_000;
 /// One raw UDP event, before byte-order decoding.
 #[derive(Clone, Copy, Debug)]
 // Kept "raw" (undecoded) so the background thread does as little work as
-// possible. Decoding happens on the main thread once we know the byte order.
+// possible. Decoding happens on the main thread once the byte order is known.
 pub struct RawUdp {
     pub t_ns: i128,
     pub pid: u32,
@@ -105,7 +105,7 @@ impl ByteOrder {
     }
 
     /// Decode into a [`Datagram`] keyed by the remote endpoint.
-    // For packets we *send*, the remote end is the destination; for packets we
+    // For packets *sent*, the remote end is the destination; for packets
     // *receive*, it's the source. Keying by the remote end puts both directions
     // of a conversation under one key.
     pub fn decode(self, r: &RawUdp) -> Datagram {
@@ -126,7 +126,7 @@ impl ByteOrder {
 /// A running kernel trace. Dropping it stops the trace (ferrisetw's
 /// `KernelTrace` implements `Drop`).
 ///
-/// The field `_trace` starts with `_` because we never read it. We only keep
+/// The field `_trace` starts with `_` because it's never read. It's only kept
 /// it alive: if it were dropped, the trace would stop.
 pub struct UdpTrace {
     _trace: KernelTrace,
@@ -136,7 +136,7 @@ pub struct UdpTrace {
 }
 
 /// Turn one ETW event into a `RawUdp`, or `None` if it's not a UDP IPv4 event
-/// from a process we care about.
+/// from a process of interest.
 ///
 /// Runs on ferrisetw's thread for *every* UDP packet on the PC, so it filters
 /// early: wrong opcode → stop; wrong PID → stop.
@@ -144,7 +144,7 @@ pub struct UdpTrace {
 /// Steps:
 ///   1. Check the opcode (send or receive).
 ///   2. Look up the event's schema (its field layout) and create a parser.
-///   3. Read the `PID` field, and keep only the game's or our own (our own
+///   3. Read the `PID` field, and keep only the game's or this program's own (its own
 ///      packets are needed for calibration).
 ///   4. Read the remaining fields. `try_parse::<T>("name")` reads a named
 ///      field as type `T`, and `.ok()?` gives up on this event if any field
@@ -192,7 +192,7 @@ fn parse_event(
 // - `Arc` = "atomically reference-counted": shared ownership across threads.
 //   `Arc::clone` just bumps a counter; both handles point at the same atomic.
 // - `AtomicU32` can be read and written from several threads without a lock.
-//   `Ordering::Relaxed` is enough: we only need the latest PID eventually,
+//   `Ordering::Relaxed` is enough: only the latest PID is needed eventually,
 //   not ordering with other memory.
 // - `move |...| { ... }` makes the closure take ownership of `tx`, `gp` and
 //   `self_pid`. That's required, because the closure outlives this function.
@@ -238,7 +238,7 @@ const CAL_SIZE: usize = 37;
 // Steps:
 //   1. Open a UDP socket on any free local port.
 //   2. Every 500 ms, send a 37-byte packet to 192.0.2.1:50001.
-//   3. Watch the channel for a 37-byte send from our own PID.
+//   3. Watch the channel for a 37-byte send from this program's own PID.
 //   4. Compare its raw address and port with the known values, both as-is and
 //      byte-swapped, to learn which interpretation is right.
 // `recv_timeout` waits up to 100 ms for an event, so the loop stays
@@ -252,7 +252,7 @@ pub fn calibrate(trace: &UdpTrace) -> Result<(ByteOrder, Vec<RawUdp>)> {
     while Instant::now() < deadline {
         if Instant::now() >= next_send {
             // Ignore errors: some networks reject TEST-NET outright, and the
-            // send event is what we need.
+            // send event is what's needed.
             let _ = sock.send_to(&[0u8; CAL_SIZE], SocketAddrV4::new(CAL_ADDR, CAL_PORT));
             next_send = Instant::now() + Duration::from_millis(500);
         }

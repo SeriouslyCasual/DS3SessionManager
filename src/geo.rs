@@ -91,7 +91,7 @@ impl GeoDb {
     ///
     /// `.with_context(|| ...)` attaches a human explanation to any error. The
     /// closure only runs if there *is* an error, so the `format!` costs
-    /// nothing on success. `?` then returns the error to our caller.
+    /// nothing on success. `?` then returns the error to the caller.
     pub fn open(path: &Path) -> Result<Self> {
         let reader = maxminddb::Reader::open_readfile(path)
             .with_context(|| format!("opening GeoIP database {}", path.display()))?;

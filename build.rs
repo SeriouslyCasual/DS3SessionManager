@@ -8,13 +8,13 @@
 //! that start with `cargo:`, such as `cargo:warning=...` or
 //! `cargo:rerun-if-changed=...`.
 //!
-//! # Why we need one
+//! # Why it's needed
 //!
-//! `steamworks-sys` links our program against `steam_api64.dll`, and Windows
+//! `steamworks-sys` links the program against `steam_api64.dll`, and Windows
 //! looks for that DLL **next to the .exe** when the program starts. If it's
 //! missing, the program can't even launch. The game folder has its own copy,
-//! but it dates from 2016 and lacks the "flat" API functions we call, so we
-//! use the copy from the Steamworks SDK bundled inside the `steamworks-sys`
+//! but it dates from 2016 and lacks the "flat" API functions this program calls, so the build
+//! uses the copy from the Steamworks SDK bundled inside the `steamworks-sys`
 //! crate.
 
 use std::env;
@@ -65,7 +65,7 @@ fn main() {
 
 /// Look in the cargo registry sources for steamworks-sys's redistributable.
 // Cargo downloads crate sources into $CARGO_HOME/registry/src/<index>/<crate>-<version>/.
-// We search there for steamworks-sys and pick the 0.13.x copy (the version our
+// The search looks there for steamworks-sys and picks the 0.13.x copy (the version
 // Cargo.toml asks for), falling back to the newest found. `?` on an `Option`
 // returns `None` early if a folder can't be read.
 fn find_dll() -> Option<PathBuf> {

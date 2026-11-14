@@ -3,10 +3,10 @@
 //! These call the Windows API through Microsoft's official `windows` crate,
 //! which provides Rust declarations for nearly every Win32 function. Calling
 //! into the OS is `unsafe` because the compiler can't check what the OS does
-//! with our pointers. So every `unsafe` block carries a `// SAFETY:` comment
+//! with the program's pointers. So every `unsafe` block carries a `// SAFETY:` comment
 //! explaining why the call is correct.
 //!
-//! Note: listing processes only reads a system snapshot. We never open a
+//! Note: listing processes only reads a system snapshot. The program never opens a
 //! handle to the game process here.
 
 use windows::Win32::Foundation::CloseHandle;

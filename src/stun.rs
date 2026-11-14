@@ -9,8 +9,8 @@
 //! port mapping open. So the game constantly produces request/response
 //! pairs for free: time from request to response is one RTT sample.
 //!
-//! The catch: kernel ETW tells us a packet's **size, endpoints and time**,
-//! but not its contents. We can't read the STUN header to confirm a packet
+//! The catch: kernel ETW reports a packet's **size, endpoints and time**,
+//! but not its contents. The STUN header can't be read to confirm a packet
 //! *is* STUN, or match a response to its request by transaction ID. Following
 //! the technique documented by DS3ConnectionInfo (reimplemented here, no code
 //! copied), Steam's checks are recognised **by payload size alone**: 56-byte
@@ -61,7 +61,7 @@ impl Default for StunConfig {
     }
 }
 
-/// Whether we sent the packet or received it.
+/// Whether the packet was sent or received.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Direction {
     Send,
@@ -125,7 +125,7 @@ impl StunMatcher {
         }
     }
 
-    /// Counters for one peer (all zeros if we've never seen it).
+    /// Counters for one peer (all zeros if it has never been seen).
     ///
     /// `.get()` returns `Option<&EndpointCounters>`, `.copied()` turns that
     /// into `Option<EndpointCounters>` (the struct is `Copy`), and

@@ -5,7 +5,7 @@
 //! SQLite is a whole database in a single file: no server to install, safe
 //! against crashes, and easy to query later from Python (`sqlite3`, `pandas`)
 //! to make graphs. The `rusqlite` crate wraps it. With its `bundled` feature,
-//! SQLite itself is compiled into our program, so users need nothing extra.
+//! SQLite itself is compiled into the program, so users need nothing extra.
 //!
 //! # Privacy
 //!
@@ -36,7 +36,7 @@ use std::path::Path;
 // `r#"..."#` is a *raw string literal*: backslashes and quotes inside need no
 // escaping, which is handy for SQL. `IF NOT EXISTS` makes it safe to run on
 // an existing file. `PRAGMA journal_mode = WAL` turns on write-ahead logging,
-// which survives crashes well and lets readers work while we write.
+// which survives crashes well and lets readers work during writes.
 const SCHEMA: &str = r#"
 PRAGMA journal_mode = WAL;
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -141,10 +141,10 @@ impl Store {
         Ok(())
     }
 
-    /// Record that we saw a peer at time `t_ns`.
+    /// Record that a peer was seen at time `t_ns`.
     ///
     /// `COALESCE(excluded.persona, peer.persona)` keeps a previously known name
-    /// if this time we only have `NULL` (Steam hadn't sent the name yet).
+    /// if this time there is only `NULL` (Steam hadn't sent the name yet).
     /// SQLite stores integers as signed 64-bit, so `u64`/`i128` values are cast
     /// with `as i64`. Steam IDs and current timestamps fit comfortably.
     pub fn upsert_peer(&self, id: SteamId, persona: Option<&str>, t_ns: i128) -> Result<()> {
@@ -185,7 +185,7 @@ impl Store {
     }
 
     /// Append one RTT sample. `id` is `Option` because ETW can time a packet to an
-    /// endpoint that Steam hasn't (yet) told us belongs to a peer.
+    /// endpoint that Steam hasn't (yet) reported as belonging to a peer.
     pub fn insert_rtt(
         &self,
         id: Option<SteamId>,

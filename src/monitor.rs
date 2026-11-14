@@ -37,7 +37,7 @@ use crate::stun::{Direction, StunConfig, StunMatcher};
 use crate::win;
 
 /// Current wall-clock time in Unix nanoseconds. If the clock is somehow
-/// before 1970, `duration_since` fails and we fall back to 0 rather than
+/// before 1970, `duration_since` fails and the function falls back to 0 rather than
 /// crashing.
 fn now_ns() -> i128 {
     SystemTime::now()
@@ -132,7 +132,7 @@ struct PeerView {
 //   6. Start ETW, calibrate the byte order, tell the trace which PID to watch.
 //   7. Loop until Ctrl+C (see the numbered steps inside the loop).
 pub fn run(args: MonitorArgs) -> Result<()> {
-    // Step 1. The inner `{ }` block lets us shadow `stop` with a clone that
+    // Step 1. The inner `{ }` block allows shadowing `stop` with a clone that
     // moves into the handler closure, while the outer `stop` stays usable here.
     let stop = Arc::new(AtomicBool::new(false));
     {
@@ -198,10 +198,10 @@ pub fn run(args: MonitorArgs) -> Result<()> {
         (Some(t), Some(bo))
     };
 
-    // Loop state. The maps are keyed so we can join Steam's view and ETW's view:
-    //   peers:       SteamId  → what we know about that player
+    // Loop state. The maps are keyed so the code can join Steam's view and ETW's view:
+    //   peers:       SteamId  → what is known about that player
     //   by_endpoint: IP:port  → SteamId (filled from Steam, read when ETW
-    //                gives us an RTT for an endpoint)
+    //                gives an RTT for an endpoint)
     //   traffic:     IP:port  → packet counters (prev_traffic = last poll's
     //                copy, used to compute packets/second)
     let mut matcher = StunMatcher::new(StunConfig {
@@ -269,9 +269,9 @@ pub fn run(args: MonitorArgs) -> Result<()> {
         // 3. Poll Steam.
         steam.run_callbacks();
         let t = now_ns();
-        // For each live peer: fetch the name, record that we saw them, update
+        // For each live peer: fetch the name, record that they were seen, update
         // the in-memory view, log the state only if it changed, remember which
-        // endpoint belongs to them, and geolocate once. We skip relayed peers,
+        // endpoint belongs to them, and geolocate once. Relayed peers are skipped,
         // because a relay's IP says nothing about where the player is.
         // `or_insert_with(|| ...)` only builds the default `PeerView` when
         // the peer is new.

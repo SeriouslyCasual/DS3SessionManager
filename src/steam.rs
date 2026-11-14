@@ -1,10 +1,10 @@
-//! Steamworks access: who we're connected to, and the state of each connection.
+//! Steamworks access: who the player is connected to, and the state of each connection.
 //!
 //! # Technique
 //!
 //! (Documented by DS3ConnectionInfo; reimplemented here, no code copied.)
 //! 1. Initialise the Steam API in **this** process using Dark Souls III's AppID
-//!    (374320), so Steam treats us as part of the running game.
+//!    (374320), so Steam treats this program as part of the running game.
 //! 2. List Steam's "coplay" list ("recently played with") via
 //!    `ISteamFriends::GetCoplayFriend`. DS3 adds players there when you meet
 //!    them.
@@ -25,10 +25,10 @@
 //! Steam's library (`steam_api64.dll`) has a C interface. Calling C from Rust
 //! is called **FFI** (Foreign Function Interface). The `steamworks-sys` crate
 //! contains auto-generated Rust *declarations* of Steam's C functions, which
-//! we import as `sys`.
+//! are imported as `sys`.
 //!
 //! The compiler can't verify what C code does with pointers, so every call is
-//! wrapped in `unsafe { ... }`. That's us promising the rules are followed,
+//! wrapped in `unsafe { ... }`. That's the programmer promising the rules are followed,
 //! and each block has a `// SAFETY:` comment saying why. `*mut T` is a *raw
 //! pointer*: unlike `&T`, it can be null, it isn't checked by the borrow
 //! checker, and using it requires `unsafe`.
@@ -59,7 +59,7 @@ pub unsafe fn set_app_id_env(app_id: u32) {
 
 /// A live connection to the Steam client.
 ///
-/// It holds the three Steam "interface" pointers we use. `Steam` is created
+/// It holds the three Steam "interface" pointers the program uses. `Steam` is created
 /// by `init()` and shuts the API down in `Drop`. Raw pointers are neither
 /// `Send` nor `Sync`, so the compiler automatically stops this struct from
 /// being moved to another thread. That suits Steam, which expects calls
@@ -68,7 +68,7 @@ pub struct Steam {
     friends: *mut sys::ISteamFriends,
     networking: *mut sys::ISteamNetworking,
     user: *mut sys::ISteamUser,
-    // Steam IDs whose names we've already asked Steam to fetch, so we ask once.
+    // Steam IDs whose names have already been requested from Steam, so each is requested once.
     requested_names: HashSet<u64>,
 }
 
@@ -76,7 +76,7 @@ impl Steam {
     /// Initialise the Steam API. Call [`set_app_id_env`] first.
     // Steps:
     //   1. `SteamAPI_InitFlat` connects to the running Steam client. On failure,
-    //      Steam writes a C string (bytes ending in 0) into our 1024-byte buffer.
+    //      Steam writes a C string (bytes ending in 0) into a 1024-byte buffer.
     //      `CStr::from_ptr` reads up to that 0, and `to_string_lossy` turns it into
     //      Rust text.
     //   2. Fetch the interface pointers (the `_v018` suffixes are API versions).
@@ -148,7 +148,7 @@ impl Steam {
     //      of integers.
     //   2. Pass a pointer to it (`&mut st` coerces to `*mut`). `false` means
     //      "no session with this player".
-    //   3. Convert into our friendlier `P2PState`: `u8` flags become `bool`, and
+    //   3. Convert into the friendlier `P2PState`: `u8` flags become `bool`, and
     //      an IP of 0 becomes `None` via `bool::then`, which gives `Some(...)` only
     //      if the condition is true.
     pub fn p2p_state(&self, id: SteamId) -> Option<P2PState> {
@@ -193,12 +193,12 @@ impl Steam {
     /// Persona name if Steam has it cached. Asks Steam to fetch it otherwise
     /// (the name shows up on a later poll once callbacks have run).
     // Steam returns "[unknown]" (or an empty string) until it has the name
-    // cached. In that case we ask once with RequestUserInformation; a later poll
+    // cached. In that case the name is requested once with RequestUserInformation; a later poll
     // will find the name. `HashSet::insert` returns true only the first time an
     // item is added, which is a neat "do this once" check.
     pub fn persona(&mut self, id: SteamId) -> Option<String> {
         // SAFETY: valid interface pointer; Steam returns a NUL-terminated
-        // UTF-8 string owned by Steam, which we copy immediately.
+        // UTF-8 string owned by Steam, which is copied immediately.
         let name = unsafe {
             let p = sys::SteamAPI_ISteamFriends_GetFriendPersonaName(self.friends, id.0);
             (!p.is_null()).then(|| CStr::from_ptr(p).to_string_lossy().into_owned())

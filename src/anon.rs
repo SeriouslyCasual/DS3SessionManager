@@ -15,7 +15,7 @@ use std::net::Ipv4Addr;
 /// Stable pseudonym: the first 12 hex digits of SHA-256(salt ‖ steam_id).
 ///
 /// - `salt: &str` borrows a string slice; the caller keeps ownership.
-/// - The return type is an owned `String`, because we build a new string here.
+/// - The return type is an owned `String`, because a new string is built here.
 pub fn pseudonym(salt: &str, steam_id: u64) -> String {
     // Step 1: create a hasher and feed it the salt bytes, then the ID's 8
     // bytes. `to_le_bytes()` gives the little-endian byte representation, so

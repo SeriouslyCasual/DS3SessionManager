@@ -1,0 +1,21 @@
+[book]
+title = "DS3SessionManager"
+description = "Real-time network telemetry and connection quality analysis in Dark Souls III"
+authors = ["SeriouslyCasual"]
+language = "en"
+src = "src"
+
+[build]
+build-dir = "book"
+create-missing = false
+
+[output.html]
+site-url = "/DS3SessionManager/"
+git-repository-url = "https://github.com/SeriouslyCasual/DS3SessionManager"
+edit-url-template = "https://github.com/SeriouslyCasual/DS3SessionManager/edit/main/docs/{path}"
+default-theme = "light"
+preferred-dark-theme = "navy"
+additional-css = ["theme/custom.css"]
+
+[output.html.search]
+enable = true

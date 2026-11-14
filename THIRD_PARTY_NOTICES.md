@@ -4,7 +4,7 @@
 
 - **DS3ConnectionInfo** by William Tremblay (tremwil), https://github.com/tremwil/DS3ConnectionInfo.
   - The repository has **no licence file**, so its code is all rights reserved.
-  - DS3SessionManager does **not** copy any of its code. Techniques such as "coplay list + `GetP2PSessionState`" and "ETW UDP timing of STUN-sized packets" are reimplemented from scratch from public documentation and our own measurements, and cited as prior art in the report.
+  - DS3SessionManager does **not** copy any of its code. Techniques such as "coplay list + `GetP2PSessionState`" and "ETW UDP timing of STUN-sized packets" are reimplemented from scratch from public documentation and independent measurements, and are cited as prior art.
 - **SteamP2PInfo** by William Tremblay (tremwil), https://github.com/tremwil/SteamP2PInfo. MIT licence.
   - No code has been ported so far. If any is, its MIT notice will be reproduced here in full.
 
