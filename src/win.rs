@@ -18,6 +18,45 @@ use windows::Win32::UI::Shell::IsUserAnAdmin;
 /// The game's executable name.
 pub const DS3_EXE: &str = "DarkSoulsIII.exe";
 
+/// The Steam client's executable name. DS3's peer-to-peer packets are sent
+/// and received by this process, not by the game (confirmed with `probe`).
+pub const STEAM_EXE: &str = "steam.exe";
+
+/// Executable name for each running PID (used by `probe`'s per-process
+/// traffic breakdown). Same snapshot walk as [`find_process`], but collects
+/// every entry.
+pub fn process_names() -> std::collections::HashMap<u32, String> {
+    let mut out = std::collections::HashMap::new();
+    // SAFETY: as in `find_process`.
+    unsafe {
+        let Ok(snap) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else {
+            return out;
+        };
+        let mut entry = PROCESSENTRY32W {
+            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
+        if Process32FirstW(snap, &mut entry).is_ok() {
+            loop {
+                let len = entry
+                    .szExeFile
+                    .iter()
+                    .position(|&c| c == 0)
+                    .unwrap_or(entry.szExeFile.len());
+                out.insert(
+                    entry.th32ProcessID,
+                    String::from_utf16_lossy(&entry.szExeFile[..len]),
+                );
+                if Process32NextW(snap, &mut entry).is_err() {
+                    break;
+                }
+            }
+        }
+        let _ = CloseHandle(snap);
+    }
+    out
+}
+
 /// Returns the process ID (PID) of the first running process whose executable
 /// name matches `exe` (ignoring upper/lower case), or `None` if none does.
 pub fn find_process(exe: &str) -> Option<u32> {
@@ -66,6 +105,33 @@ pub fn find_process(exe: &str) -> Option<u32> {
         // result on purpose; there's nothing useful to do if closing fails.
         let _ = CloseHandle(snap);
         found
+    }
+}
+
+/// Turn on ANSI escape-code handling in the Windows console.
+///
+/// The live table redraws itself with `ESC[2J ESC[H` ("clear screen, cursor
+/// home"). Windows Terminal understands that out of the box, but the classic
+/// console host behind cmd.exe and PowerShell only does once a program
+/// enables "virtual terminal processing" on its output handle. Without this,
+/// the codes print literally (`←[2J←[H`) and each refresh is appended below
+/// the last instead of replacing it. Failure is ignored: if output is
+/// redirected to a file there is no console mode to set.
+pub fn enable_ansi() {
+    use windows::Win32::System::Console::{
+        CONSOLE_MODE, ENABLE_VIRTUAL_TERMINAL_PROCESSING, GetConsoleMode, GetStdHandle,
+        STD_OUTPUT_HANDLE, SetConsoleMode,
+    };
+    // SAFETY: standard handle query plus get/set of its mode with a valid
+    // out-pointer; no memory is shared with the OS beyond the call.
+    unsafe {
+        let Ok(h) = GetStdHandle(STD_OUTPUT_HANDLE) else {
+            return;
+        };
+        let mut mode = CONSOLE_MODE(0);
+        if GetConsoleMode(h, &mut mode).is_ok() {
+            let _ = SetConsoleMode(h, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+        }
     }
 }
 

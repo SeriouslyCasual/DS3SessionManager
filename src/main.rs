@@ -32,6 +32,7 @@
 mod anon; // anonymization helpers for exported data
 mod geo; // distance, speed-of-light bound, GeoIP lookups
 mod model; // shared data types (SteamId, P2PState, ...)
+mod relay; // infers which Valve relay endpoint carries a relayed peer
 mod stats; // rolling median / p95 / jitter
 mod store; // SQLite logging and CSV export
 mod stun; // pairs STUN request/reply packets into RTT samples

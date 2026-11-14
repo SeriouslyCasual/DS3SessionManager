@@ -36,17 +36,18 @@
 //! shared with `Arc`. See `start()` for the details.
 
 use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
-use ferrisetw::EventRecord;
 use ferrisetw::parser::Parser;
-use ferrisetw::provider::{Provider, kernel_providers};
+use ferrisetw::provider::Provider;
+use ferrisetw::provider::kernel_providers::KernelProvider;
 use ferrisetw::schema_locator::SchemaLocator;
 use ferrisetw::trace::KernelTrace;
+use ferrisetw::{EventRecord, GUID};
 
 use crate::stun::{Datagram, Direction};
 
@@ -55,6 +56,30 @@ use crate::stun::{Datagram, Direction};
 // the kernel's published event schema (MOF class `UdpIp_TypeGroup1`).
 const OP_SEND_V4: u8 = 10;
 const OP_RECV_V4: u8 = 11;
+
+/// Special `game_pid` value: forward UDP events from **every** process.
+/// Used only by `probe`'s short per-process breakdown, to find out which
+/// process actually carries a peer's traffic.
+pub const ALL_PIDS: u32 = u32::MAX - 1;
+
+/// The kernel's UDP event class (`UdpIp`), enabled by the TCP/IP flag.
+///
+/// One kernel flag (`EVENT_TRACE_FLAG_NETWORK_TCPIP`, 0x10000) turns on two
+/// event classes with *different* provider GUIDs: `TcpIp` (9a280ac0-…) and
+/// `UdpIp` (bf3a50c5-…). Both use opcodes 10/11 for send/receive, with the
+/// same field names. ferrisetw only hands an event to a callback whose
+/// provider GUID matches the event's, so the callback must be registered
+/// under the **UdpIp** GUID. Registering it under ferrisetw's ready-made
+/// `TCP_IP_PROVIDER` instead delivers TCP packets only, and no UDP at all.
+static UDP_IP_PROVIDER: KernelProvider = KernelProvider::new(
+    GUID::from_values(
+        0xbf3a50c5,
+        0xa9c9,
+        0x4988,
+        [0xa0, 0x05, 0x2d, 0xf0, 0xb7, 0xc8, 0x0f, 0x80],
+    ),
+    0x0001_0000, // EVENT_TRACE_FLAG_NETWORK_TCPIP
+);
 
 /// FILETIME of the Unix epoch, in 100 ns units.
 // FILETIME counts 100-ns ticks from 1601-01-01. This constant is how many
@@ -132,7 +157,71 @@ pub struct UdpTrace {
     _trace: KernelTrace,
     /// PIDs whose events are forwarded (the game, plus this process for calibration).
     pub game_pid: Arc<AtomicU32>,
+    /// The Steam client's PID. DS3's peer-to-peer traffic (including the
+    /// STUN checks) is sent and received by steam.exe, not by the game.
+    pub steam_pid: Arc<AtomicU32>,
     pub rx: Receiver<RawUdp>,
+    /// Counters for every place an event can be dropped (see [`Diag`]).
+    pub diag: Arc<Diag>,
+}
+
+/// Diagnostic counters, filled on ferrisetw's thread.
+///
+/// The callback drops events silently at several points (wrong opcode,
+/// missing schema, missing field, wrong PID). When calibration fails, these
+/// counters show *where* events are lost: no events at all means the session
+/// isn't delivering; events with schema errors mean TDH can't describe them;
+/// and so on.
+#[derive(Default)]
+pub struct Diag {
+    /// Every event the callback saw, of any opcode.
+    pub total: AtomicU64,
+    /// Events with the IPv4 UDP send/receive opcodes.
+    pub udp_v4: AtomicU64,
+    /// IPv4 UDP events whose schema couldn't be looked up.
+    pub schema_err: AtomicU64,
+    /// IPv4 UDP events missing a field (or with an unexpected field size).
+    pub field_err: AtomicU64,
+    /// IPv4 UDP events from this process (the calibration packets).
+    pub self_pid: AtomicU64,
+    /// One bit per opcode seen, to spot e.g. IPv6-only traffic (opcodes 26/27).
+    pub opcodes: [AtomicU64; 4],
+    /// The first schema or field error, verbatim.
+    pub first_err: Mutex<Option<String>>,
+}
+
+impl Diag {
+    fn note_err(&self, msg: String) {
+        if let Ok(mut g) = self.first_err.lock() {
+            g.get_or_insert(msg);
+        }
+    }
+
+    /// One-line summary for error messages.
+    pub fn summary(&self) -> String {
+        let ops: Vec<String> = (0..256u32)
+            .filter(|&op| {
+                self.opcodes[(op / 64) as usize].load(Ordering::Relaxed) & (1u64 << (op % 64)) != 0
+            })
+            .map(|op| op.to_string())
+            .collect();
+        let first = self
+            .first_err
+            .lock()
+            .ok()
+            .and_then(|g| g.clone())
+            .unwrap_or_else(|| "none".into());
+        format!(
+            "events seen={} udp_v4={} schema_err={} field_err={} own_pid={} opcodes=[{}] first_err={}",
+            self.total.load(Ordering::Relaxed),
+            self.udp_v4.load(Ordering::Relaxed),
+            self.schema_err.load(Ordering::Relaxed),
+            self.field_err.load(Ordering::Relaxed),
+            self.self_pid.load(Ordering::Relaxed),
+            ops.join(","),
+            first
+        )
+    }
 }
 
 /// Turn one ETW event into a `RawUdp`, or `None` if it's not a UDP IPv4 event
@@ -147,23 +236,52 @@ pub struct UdpTrace {
 ///   3. Read the `PID` field, and keep only the game's or this program's own (its own
 ///      packets are needed for calibration).
 ///   4. Read the remaining fields. `try_parse::<T>("name")` reads a named
-///      field as type `T`, and `.ok()?` gives up on this event if any field
-///      is missing.
+///      field as type `T`; any failure is counted in `diag` and the event
+///      is dropped.
 fn parse_event(
     record: &EventRecord,
     locator: &SchemaLocator,
     self_pid: u32,
     game_pid: u32,
+    steam_pid: u32,
+    diag: &Diag,
 ) -> Option<RawUdp> {
-    let dir = match record.opcode() {
+    let op = record.opcode();
+    diag.total.fetch_add(1, Ordering::Relaxed);
+    diag.opcodes[(op / 64) as usize].fetch_or(1u64 << (op % 64), Ordering::Relaxed);
+    let dir = match op {
         OP_SEND_V4 => Direction::Send,
         OP_RECV_V4 => Direction::Recv,
         _ => return None,
     };
-    let schema = locator.event_schema(record).ok()?;
+    diag.udp_v4.fetch_add(1, Ordering::Relaxed);
+    let schema = match locator.event_schema(record) {
+        Ok(s) => s,
+        Err(e) => {
+            diag.schema_err.fetch_add(1, Ordering::Relaxed);
+            diag.note_err(format!("schema: {e:?}"));
+            return None;
+        }
+    };
     let p = Parser::create(record, &schema);
-    let pid: u32 = p.try_parse("PID").ok()?;
-    if pid != game_pid && pid != self_pid {
+    // A small macro so each field failure records which field broke.
+    macro_rules! field {
+        ($name:literal) => {
+            match p.try_parse($name) {
+                Ok(v) => v,
+                Err(e) => {
+                    diag.field_err.fetch_add(1, Ordering::Relaxed);
+                    diag.note_err(format!("field {}: {e:?}", $name));
+                    return None;
+                }
+            }
+        };
+    }
+    let pid: u32 = field!("PID");
+    if pid == self_pid {
+        diag.self_pid.fetch_add(1, Ordering::Relaxed);
+    }
+    if game_pid != ALL_PIDS && pid != game_pid && pid != steam_pid && pid != self_pid {
         return None;
     }
     let ft = record.raw_timestamp();
@@ -171,11 +289,11 @@ fn parse_event(
         t_ns: (ft - FILETIME_UNIX_EPOCH) as i128 * 100,
         pid,
         dir,
-        daddr: p.try_parse("daddr").ok()?,
-        saddr: p.try_parse("saddr").ok()?,
-        dport: p.try_parse("dport").ok()?,
-        sport: p.try_parse("sport").ok()?,
-        size: p.try_parse("size").ok()?,
+        daddr: field!("daddr"),
+        saddr: field!("saddr"),
+        dport: field!("dport"),
+        sport: field!("sport"),
+        size: field!("size"),
     })
 }
 
@@ -186,6 +304,7 @@ fn parse_event(
 //   ----------------                      ------------------------
 //   callback(event) ──tx.send(RawUdp)──►  rx.try_recv() in the loop
 //   gp.load()  ◄──── shared AtomicU32 ──  game_pid.store(pid)
+//   sp.load()  ◄──── shared AtomicU32 ──  steam_pid.store(pid)
 //
 // - `channel()` creates a Sender (`tx`) and Receiver (`rx`). Sending *moves*
 //   the value into the queue, so no locking is needed.
@@ -203,14 +322,25 @@ fn parse_event(
 pub fn start() -> Result<UdpTrace> {
     let (tx, rx): (Sender<RawUdp>, Receiver<RawUdp>) = channel();
     let game_pid = Arc::new(AtomicU32::new(u32::MAX));
+    let steam_pid = Arc::new(AtomicU32::new(u32::MAX));
     let self_pid = std::process::id();
     let gp = Arc::clone(&game_pid);
+    let sp = Arc::clone(&steam_pid);
+    let diag = Arc::new(Diag::default());
+    let d = Arc::clone(&diag);
     let callback = move |record: &EventRecord, locator: &SchemaLocator| {
-        if let Some(ev) = parse_event(record, locator, self_pid, gp.load(Ordering::Relaxed)) {
+        if let Some(ev) = parse_event(
+            record,
+            locator,
+            self_pid,
+            gp.load(Ordering::Relaxed),
+            sp.load(Ordering::Relaxed),
+            &d,
+        ) {
             let _ = tx.send(ev);
         }
     };
-    let provider = Provider::kernel(&kernel_providers::TCP_IP_PROVIDER)
+    let provider = Provider::kernel(&UDP_IP_PROVIDER)
         .add_callback(callback)
         .build();
     let trace = KernelTrace::new()
@@ -222,7 +352,9 @@ pub fn start() -> Result<UdpTrace> {
     Ok(UdpTrace {
         _trace: trace,
         game_pid,
+        steam_pid,
         rx,
+        diag,
     })
 }
 
@@ -249,11 +381,14 @@ pub fn calibrate(trace: &UdpTrace) -> Result<(ByteOrder, Vec<RawUdp>)> {
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut kept = Vec::new();
     let mut next_send = Instant::now();
+    let mut send_err: Option<String> = None;
     while Instant::now() < deadline {
         if Instant::now() >= next_send {
-            // Ignore errors: some networks reject TEST-NET outright, and the
-            // send event is what's needed.
-            let _ = sock.send_to(&[0u8; CAL_SIZE], SocketAddrV4::new(CAL_ADDR, CAL_PORT));
+            // Don't stop on errors: some networks reject TEST-NET outright, and
+            // the send event is what's needed. Keep the error for the report.
+            if let Err(e) = sock.send_to(&[0u8; CAL_SIZE], SocketAddrV4::new(CAL_ADDR, CAL_PORT)) {
+                send_err.get_or_insert(e.to_string());
+            }
             next_send = Instant::now() + Duration::from_millis(500);
         }
         match trace.rx.recv_timeout(Duration::from_millis(100)) {
@@ -287,7 +422,9 @@ pub fn calibrate(trace: &UdpTrace) -> Result<(ByteOrder, Vec<RawUdp>)> {
         }
     }
     Err(anyhow!(
-        "no ETW UDP event seen for the calibration packet within 5 s"
+        "no ETW UDP event seen for the calibration packet within 5 s ({}; send_err={})",
+        trace.diag.summary(),
+        send_err.as_deref().unwrap_or("none")
     ))
 }
 
@@ -297,6 +434,15 @@ pub fn calibrate(trace: &UdpTrace) -> Result<(ByteOrder, Vec<RawUdp>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The callback must sit on the UdpIp class, not TcpIp (see `UDP_IP_PROVIDER`).
+    #[test]
+    fn provider_is_udpip_class() {
+        assert_eq!(
+            UDP_IP_PROVIDER.guid,
+            GUID::from("bf3a50c5-a9c9-4988-a005-2df0b7c80f80")
+        );
+    }
 
     #[test]
     fn decode_uses_remote_side() {
