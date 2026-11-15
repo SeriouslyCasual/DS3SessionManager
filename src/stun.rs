@@ -3,8 +3,9 @@
 //! # The networking idea
 //!
 //! Players behind home routers (NATs) can't simply connect to each other.
-//! Steam uses ICE (RFC 8445): it repeatedly sends small **STUN** (RFC 8489)
-//! "binding request" packets and receives "binding response" packets. These
+//! Steam uses ICE (RFC 8445): it repeatedly sends small **STUN** "binding
+//! request" packets and receives "binding response" packets (E2 showed
+//! Steam uses the classic RFC 3489 format, one check about every 500 ms). These
 //! connectivity checks keep running for the whole session to keep the NAT's
 //! port mapping open. So the game constantly produces request/response
 //! pairs for free: time from request to response is one RTT sample.
@@ -22,11 +23,24 @@
 //!
 //! Requests to each peer are queued in time order. When a reply arrives:
 //! 1. requests older than `timeout` are discarded and counted as **lost**;
-//! 2. the reply is paired with the **oldest** remaining request.
+//! 2. the reply is paired with the **newest** request sent before it, and
+//!    any older outstanding requests are counted as **lost** (their replies
+//!    never came).
 //!
-//! Without transaction IDs some ambiguity is unavoidable: if one reply is
-//! lost, the next reply could be paired with the wrong request. The counters
-//! below make that measurable rather than hidden.
+//! Why newest and not oldest: without transaction IDs some ambiguity is
+//! unavoidable, and the oldest-first rule (used until the relay tests on
+//! 2026-11-14) fails badly after a single lost reply. The unanswered request
+//! stays at the front of the queue, so every later reply is paired with the
+//! request sent one check *earlier*: a relayed 22 ms RTT read as ~515 ms for
+//! the rest of the session, because at one check per 500 ms the stale
+//! request never reached the 2 s timeout. Newest-first recovers on the very
+//! next reply.
+//!
+//! Its limit: it assumes the RTT is shorter than the check interval (~500
+//! ms). With longer RTTs two checks are in flight at once, a reply gets
+//! paired with the later request (reading too low), and the next reply finds
+//! nothing to pair with. RTTs that long are far outside playable DS3
+//! conditions, and `unmatched_replies` makes them visible.
 //!
 //! # The Rust idea
 //!
@@ -171,10 +185,18 @@ impl StunMatcher {
             }
         }
 
-        // Step 2: pair with the oldest remaining request, if any.
-        match q.pop_front() {
-            // Normal case: the request happened before the reply.
-            Some(t_req) if t_req <= d.t_ns => {
+        // Step 2: pair with the newest request sent at or before the reply.
+        // `rposition` searches from the back and returns its index. Requests
+        // timestamped after the reply (out-of-order events; shouldn't happen)
+        // are left alone, so the RTT can never be negative.
+        match q.iter().rposition(|&t| t <= d.t_ns) {
+            Some(i) => {
+                let t_req = q[i];
+                // The `i` requests in front of it were never answered.
+                c.lost_requests += i as u64;
+                // `drain(..=i)` removes the paired request and everything
+                // older in one step.
+                q.drain(..=i);
                 c.matched += 1;
                 Some(Matched {
                     remote: d.remote,
@@ -183,14 +205,7 @@ impl StunMatcher {
                     rtt_ms: (d.t_ns - t_req) as f64 / 1e6,
                 })
             }
-            // Out-of-order timestamps (shouldn't happen, but don't produce a
-            // negative RTT): put the request back and ignore this reply.
-            Some(t_req) => {
-                q.push_front(t_req);
-                c.unmatched_replies += 1;
-                None
-            }
-            // A reply with no request waiting.
+            // A reply with no request waiting (or only later ones).
             None => {
                 c.unmatched_replies += 1;
                 None
@@ -249,15 +264,51 @@ mod tests {
         assert_eq!(m.counters(&peer()).lost_requests, 1);
     }
 
+    /// The relay-test incident: checks every 500 ms, ~22 ms RTT, one reply
+    /// lost. Every later sample must still read ~22 ms, and the loss counts.
     #[test]
-    fn oldest_outstanding_request_is_used() {
+    fn one_lost_reply_does_not_shift_later_pairs() {
+        let mut m = StunMatcher::new(StunConfig::default());
+        let mut rtts = Vec::new();
+        for k in 0..10 {
+            let t = k * 500;
+            m.observe(&dg(t, Direction::Send, 56));
+            if k == 4 {
+                continue; // this reply is lost
+            }
+            rtts.push(m.observe(&dg(t + 22, Direction::Recv, 68)).unwrap().rtt_ms);
+        }
+        assert_eq!(rtts.len(), 9);
+        assert!(rtts.iter().all(|r| (r - 22.0).abs() < 1e-9), "{rtts:?}");
+        let c = m.counters(&peer());
+        assert_eq!((c.requests, c.matched, c.lost_requests), (10, 9, 1));
+        assert_eq!(c.unmatched_replies, 0);
+    }
+
+    /// The documented limit: RTT longer than the check interval. Two checks
+    /// are in flight; the first reply pairs with the later request.
+    #[test]
+    fn rtt_beyond_check_interval_reads_low_and_is_visible() {
         let mut m = StunMatcher::new(StunConfig::default());
         m.observe(&dg(0, Direction::Send, 56));
-        m.observe(&dg(20, Direction::Send, 56));
-        let a = m.observe(&dg(50, Direction::Recv, 68)).unwrap();
-        let b = m.observe(&dg(70, Direction::Recv, 68)).unwrap();
-        assert!((a.rtt_ms - 50.0).abs() < 1e-9);
-        assert!((b.rtt_ms - 50.0).abs() < 1e-9);
+        m.observe(&dg(500, Direction::Send, 56));
+        let a = m.observe(&dg(600, Direction::Recv, 68)).unwrap(); // reply to t=0
+        assert!((a.rtt_ms - 100.0).abs() < 1e-9);
+        assert!(m.observe(&dg(1100, Direction::Recv, 68)).is_none()); // reply to t=500
+        let c = m.counters(&peer());
+        assert_eq!((c.lost_requests, c.unmatched_replies), (1, 1));
+    }
+
+    #[test]
+    fn requests_after_the_reply_are_kept() {
+        let mut m = StunMatcher::new(StunConfig::default());
+        m.observe(&dg(0, Direction::Send, 56));
+        m.observe(&dg(40, Direction::Send, 56)); // sent after the reply below
+        let a = m.observe(&dg(30, Direction::Recv, 68)).unwrap();
+        assert!((a.rtt_ms - 30.0).abs() < 1e-9);
+        let b = m.observe(&dg(60, Direction::Recv, 68)).unwrap();
+        assert!((b.rtt_ms - 20.0).abs() < 1e-9);
+        assert_eq!(m.counters(&peer()).lost_requests, 0);
     }
 
     #[test]

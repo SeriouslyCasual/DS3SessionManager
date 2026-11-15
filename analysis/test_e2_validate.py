@@ -162,21 +162,31 @@ class Pairing(unittest.TestCase):
         t = ev.pair_by_txid(g)
         rtts = sorted(p.rtt_ms for p in t.pairs)
         self.assertEqual(rtts, [5.0, 30.0])
-        # The size rule pairs by age, so both of its pairs are wrong here.
-        rule, _, _ = ev.size_rule_pairs(g)
+        # Two checks in flight (the newest rule's documented limit): it gets
+        # the first reply right and has nothing left for the second.
+        rule, lost, unmatched = ev.size_rule_pairs(g)
         acc = ev.pairing_accuracy(rule, t)
+        self.assertEqual((acc["correct"], acc["wrong_request"], lost, unmatched), (1, 0, 1, 1))
+        # The old rule pairs by age, so both of its pairs are wrong here.
+        old, _, _ = ev.size_rule_pairs(g, policy="oldest")
+        acc = ev.pairing_accuracy(old, t)
         self.assertEqual((acc["correct"], acc["wrong_request"]), (0, 2))
 
-    def test_lost_reply_misleads_size_rule(self):
-        # Reply to request 1 is lost; request 2's reply is paired with request 1.
+    def test_lost_reply(self):
+        # Reply to request 1 is lost.
         g = [req(0, 1), req(500, 2), resp(503, 2), req(1000, 3), resp(1003, 3)]
         t = ev.pair_by_txid(g)
         self.assertEqual((len(t.pairs), t.unanswered), (2, 1))
+        # Newest rule: both pairs right, the loss counted.
         rule, lost, _ = ev.size_rule_pairs(g)
         acc = ev.pairing_accuracy(rule, t)
-        self.assertEqual(acc["wrong_request"], 2)
-        self.assertAlmostEqual(rule[0].rtt_ms, 503.0)
-        self.assertEqual(lost, 0)
+        self.assertEqual((acc["correct"], acc["wrong_request"], lost), (2, 0, 1))
+        self.assertAlmostEqual(rule[0].rtt_ms, 3.0)
+        # Old rule: shifted by one check for the rest of the run, no loss seen.
+        old, old_lost, _ = ev.size_rule_pairs(g, policy="oldest")
+        acc = ev.pairing_accuracy(old, t)
+        self.assertEqual((acc["wrong_request"], old_lost), (2, 0))
+        self.assertAlmostEqual(old[0].rtt_ms, 503.0)
 
     def test_timeout_drops_stale_request(self):
         g = [req(0, 1), req(2500, 2), resp(2503, 2)]

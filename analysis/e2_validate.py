@@ -19,7 +19,8 @@ What it reports:
    capture showed Steam's checks use the classic format.
 2. Precision and recall of ds3sm's size rule ("a 56-byte send is a STUN
    request, a 68-byte receive is a reply"), and the STUN sizes it misses.
-3. The size rule's pairing (oldest outstanding request, 2 s timeout) replayed
+3. The size rule's pairing (newest request before the reply, 2 s timeout;
+   the older oldest-request rule is reported alongside) replayed
    on the capture and checked against the transaction IDs: how often it
    picks the wrong request.
 4. ETW RTT samples from the run database matched to the capture pairs by
@@ -500,7 +501,7 @@ def pair_by_txid(dg: list[Dgram]) -> TruthResult:
     """Pair our outbound binding requests with inbound responses by transaction ID.
 
     For a retransmitted request the first send is used (what ds3sm's
-    oldest-outstanding rule would also pick) and the pair is marked.
+    old oldest-outstanding rule would also pick) and the pair is marked.
     """
     first: dict[bytes, int] = {}
     count: Counter[bytes] = Counter()
@@ -531,12 +532,24 @@ def pair_by_txid(dg: list[Dgram]) -> TruthResult:
 
 
 def size_rule_pairs(
-    dg: list[Dgram], req_size: int = REQ_SIZE, reply_size: int = REPLY_SIZE, timeout_ns: int = TIMEOUT_NS
+    dg: list[Dgram],
+    req_size: int = REQ_SIZE,
+    reply_size: int = REPLY_SIZE,
+    timeout_ns: int = TIMEOUT_NS,
+    policy: str = "newest",
 ) -> tuple[list[Pair], int, int]:
-    """Replicate src/stun.rs: oldest outstanding request, stale ones count as lost.
+    """Replicate src/stun.rs's size-rule pairing.
+
+    `policy="newest"` (ds3sm since the relay tests): pair each reply with the
+    newest request sent before it; older outstanding requests count as lost.
+    `policy="oldest"` (ds3sm before): pair with the oldest outstanding
+    request; kept to show how it fails after a lost reply. In both, requests
+    older than the timeout count as lost.
 
     Returns (pairs, lost_requests, unmatched_replies).
     """
+    if policy not in ("newest", "oldest"):
+        raise ValueError(policy)
     q: list[int] = []  # indices of pending requests, oldest first
     pairs: list[Pair] = []
     lost = unmatched = 0
@@ -547,11 +560,18 @@ def size_rule_pairs(
             while q and g.t_ns - dg[q[0]].t_ns > timeout_ns:
                 q.pop(0)
                 lost += 1
-            if q and dg[q[0]].t_ns <= g.t_ns:
-                j = q.pop(0)
-                pairs.append(Pair(dg[j].t_ns, g.t_ns, j, i))
-            else:
+            eligible = [k for k, j in enumerate(q) if dg[j].t_ns <= g.t_ns]
+            if not eligible:
                 unmatched += 1
+                continue
+            k = eligible[-1] if policy == "newest" else eligible[0]
+            if policy == "newest":
+                lost += k  # older outstanding requests were never answered
+                j = q[k]
+                del q[: k + 1]
+            else:
+                j = q.pop(k)
+            pairs.append(Pair(dg[j].t_ns, g.t_ns, j, i))
     return pairs, lost, unmatched
 
 
@@ -904,7 +924,11 @@ def print_report(r: dict, baseline: dict | None) -> None:
     p(f"\nSize rule pairing replayed on the capture: {a['rule_pairs']} pairs, {a['correct']} correct, "
       f"{a['wrong_request']} wrong request, {a['reply_not_stun']} reply not STUN, "
       f"{a['truth_missed']} truth pairs missed; lost {a['lost_requests']}, unmatched replies {a['unmatched_replies']}")
-    p(f"  pair precision {_f(a['precision'], 4)}  recall {_f(a['recall'], 4)}")
+    p(f"  pair precision {_f(a['precision'], 4)}  recall {_f(a['recall'], 4)}  (newest-request rule)")
+    o = r.get("pairing_oldest_rule")
+    if o:
+        p(f"  old oldest-request rule: {o['correct']} correct, {o['wrong_request']} wrong, "
+          f"precision {_f(o['precision'], 4)}  recall {_f(o['recall'], 4)}")
     if a["wrong_pair_rtt_error_ms"]:
         p(_line("wrong-pair RTT error", a["wrong_pair_rtt_error_ms"], "ms"))
     e = r.get("etw")
@@ -988,6 +1012,10 @@ def _analyse(capture: str, db: sqlite3.Connection | None, endpoint: tuple[str, i
     rule, lost, unmatched = size_rule_pairs(dg)
     acc = pairing_accuracy(rule, truth)
     acc["lost_requests"], acc["unmatched_replies"] = lost, unmatched
+    # The pre-2026-11-14 rule, for comparison.
+    old, old_lost, old_unmatched = size_rule_pairs(dg, policy="oldest")
+    acc_old = pairing_accuracy(old, truth)
+    acc_old["lost_requests"], acc_old["unmatched_replies"] = old_lost, old_unmatched
     r: dict = {
         "endpoint": mask(endpoint),
         "endpoint_kind": kind,
@@ -1008,6 +1036,7 @@ def _analyse(capture: str, db: sqlite3.Connection | None, endpoint: tuple[str, i
         },
         "size_rule": size_rule_quality(dg),
         "pairing": acc,
+        "pairing_oldest_rule": acc_old,
         "profile": profile(dg),
         "siblings": sibling_report(udps, endpoint),
     }
