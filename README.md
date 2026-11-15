@@ -76,7 +76,7 @@ The program is `target\release\ds3sm.exe`. The build places the required `steam_
 
 | Column | Meaning |
 |---|---|
-| `st` | `A` = connected, `C` = connecting |
+| `st` | `A` = connected, `C` = connecting. `A!` = Steam says connected, but no game data has reached your PC over UDP for several seconds: Steam has probably moved the connection somewhere the tool can't see (e.g. through its own servers), so the ping, jitter and loss numbers are out of date. This happens when the connection is very bad. |
 | `relay` | `no` = direct. `yes*` = going through a Valve relay server, and ds3sm found the relay's connections. `yes` = Steam says it's relayed, but the relay wasn't found. |
 | `via` | Which signs of a relay were seen: `F` Steam's own flag, `P` the traffic pattern, `A` the network owner (needs the ASN database), `L` ds3sm's built-in list of Valve relay addresses. `-` = none. |
 | `remote` | The address the ping is measured to: the player, or the relay server |

@@ -360,6 +360,31 @@ struct PeerView {
     relay_eps: Vec<SocketAddrV4>,
     /// Where the relay server is (not the player).
     relay_geo: Option<RelayGeo>,
+    /// Since when Steam has called the session active while no UDP arrived
+    /// from any of the peer's endpoints (see [`unseen_step`]).
+    unseen_since: Option<i128>,
+    /// Whether `path_unseen` is the last logged path event.
+    unseen_logged: bool,
+}
+
+/// How long an active session must stay silent on UDP, beyond the 5 s rate
+/// window, before its path counts as unseen. Covers the ~1.5 s of zero rate
+/// right after Steam moves the session to a new endpoint.
+const UNSEEN_HOLD_NS: i128 = 3_000_000_000;
+
+/// Track an "unseen path": Steam reports the session active (not
+/// connecting), yet no UDP arrives from the player. E3 C2 showed Steam can
+/// move a session off UDP altogether (most likely to TCP through its own
+/// servers) while `GetP2PSessionState` keeps reporting a LAN address, so
+/// ETW sees nothing and RTT, jitter and loss go stale. Returns the new
+/// "silent since" time.
+fn unseen_step(since: Option<i128>, active: bool, pps_in: f64, t: i128) -> Option<i128> {
+    (active && pps_in == 0.0).then(|| since.unwrap_or(t))
+}
+
+/// Whether a peer silent since `since` counts as unseen at `t`.
+fn path_unseen(since: Option<i128>, t: i128) -> bool {
+    since.is_some_and(|s| t - s >= UNSEEN_HOLD_NS)
 }
 
 /// A relay server's location: Steam's relay site if the address matches
@@ -395,6 +420,8 @@ impl PeerView {
             relay_ip: None,
             relay_eps: Vec::new(),
             relay_geo: None,
+            unseen_since: None,
+            unseen_logged: false,
         }
     }
 
@@ -662,6 +689,10 @@ pub fn run(args: MonitorArgs) -> Result<()> {
                 view.last_logged_state = Some(view.state.clone());
                 store.event(t, "peer_left", &id.to_string())?;
             }
+            if !current.contains(id) {
+                view.unseen_since = None;
+                view.unseen_logged = false;
+            }
         }
 
         // 4. Relays: run the detectors, attribute relay endpoints, place the relay.
@@ -694,6 +725,34 @@ pub fn run(args: MonitorArgs) -> Result<()> {
                 }
             } else if view.geo_ip != Some(*remote.ip()) {
                 locate(view, *id, remote, geodb.as_ref(), home, &store)?;
+            }
+        }
+
+        // 5b. Unseen path: active session, no UDP from the player.
+        for (id, st) in &active {
+            let Some(view) = peers.get_mut(id) else {
+                continue;
+            };
+            let pps_in: f64 = view
+                .endpoints()
+                .iter()
+                .map(|e| ep_rates(e, &traffic, &side, t).0)
+                .sum();
+            // Relayed by Steam's flag with no relay endpoint found yet is its
+            // own case ("yes" in the table), not an unseen path.
+            let relay_unfound = view.evidence.relayed(&ctx.detectors) && view.relay_eps.is_empty();
+            view.unseen_since = unseen_step(
+                view.unseen_since,
+                st.active && !st.connecting && !relay_unfound,
+                pps_in,
+                t,
+            );
+            let unseen = path_unseen(view.unseen_since, t);
+            if unseen != view.unseen_logged {
+                let remote = st.remote.map_or("-".into(), |r| r.to_string());
+                let kind = if unseen { "path_unseen" } else { "path_seen" };
+                store.event(t, kind, &format!("{id} {remote}"))?;
+                view.unseen_logged = unseen;
             }
         }
 
@@ -1239,7 +1298,9 @@ fn draw(
     for id in current {
         let Some(v) = peers.get(id) else { continue };
         let s = v.rtt.summary();
-        let st = if v.state.active {
+        let st = if v.state.active && path_unseen(v.unseen_since, t_now) {
+            "A!"
+        } else if v.state.active {
             "A"
         } else if v.state.connecting {
             "C"
@@ -1339,6 +1400,18 @@ fn draw(
         .iter()
         .filter_map(|id| peers.get(id).map(|v| (*id, v)))
         .collect();
+    for (_, v) in shown
+        .iter()
+        .filter(|(_, v)| v.state.active && path_unseen(v.unseen_since, t_now))
+    {
+        let name = v.persona.clone().unwrap_or_else(|| "?".into());
+        let secs = v.unseen_since.map_or(0, |s| (t_now - s) / 1_000_000_000);
+        out.push_str(&format!(
+            "A! {name}: Steam says the session is active, but no UDP has arrived from them for {secs} s. \
+             The traffic has probably moved off UDP (e.g. through Steam's servers), which ds3sm can't see; \
+             RTT, jit and nrep% are stale.\n"
+        ));
+    }
     let any_relayed = shown.iter().any(|(_, v)| v.evidence.relayed(det));
     if any_relayed {
         out.push_str(&format!(
@@ -1549,6 +1622,23 @@ mod tests {
     fn missing_steam_pid_matches_nothing() {
         let (peer, m) = peer_map();
         assert!(!counts_packet(STEAM, peer, GAME, u32::MAX, &m));
+    }
+
+    /// E3 C2: Steam said "active" while the traffic had left UDP. The path
+    /// counts as unseen only after UNSEEN_HOLD_NS of zero inbound rate; any
+    /// packet, or the session connecting or ending, clears it.
+    #[test]
+    fn unseen_path_needs_sustained_silence_on_an_active_session() {
+        let s = 1_000_000_000;
+        let mut since = unseen_step(None, true, 0.0, 10 * s);
+        assert_eq!(since, Some(10 * s));
+        since = unseen_step(since, true, 0.0, 12 * s);
+        assert!(!path_unseen(since, 12 * s));
+        since = unseen_step(since, true, 0.0, 13 * s);
+        assert!(path_unseen(since, 13 * s));
+        assert_eq!(unseen_step(since, true, 0.2, 14 * s), None);
+        assert_eq!(unseen_step(since, false, 0.0, 14 * s), None);
+        assert!(!path_unseen(None, 99 * s));
     }
 
     /// E3 Block C: an endpoint abandoned after a relay switch kept logging
