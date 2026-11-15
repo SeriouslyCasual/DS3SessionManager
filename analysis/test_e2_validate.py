@@ -235,6 +235,108 @@ class EtwMatching(unittest.TestCase):
         self.assertEqual((r["matched"], r["etw_unmatched"]), (2, 1))
 
 
+def attr(t: int, value: bytes, pad: bool = True) -> bytes:
+    return struct.pack(">HH", t, len(value)) + value + (b"\0" * (-len(value) % 4) if pad else b"")
+
+
+def gturn(t: int, inner: bytes, outbound: bool) -> bytes:
+    """A relay-wrapped packet in the E2 layout (data indication or send request).
+
+    As in the real capture, the final DATA attribute isn't padded.
+    """
+    data = attr(0x0013, inner, pad=False)
+    if outbound:  # send request: cookie, username(16), destination(8), data
+        body = attr(0x000F, b"\x72\xc6\x4b\xc6") + attr(0x0006, b"u" * 16) + attr(0x0011, bytes(8)) + data
+    else:  # data indication: cookie, source address(8), data
+        body = attr(0x000F, b"\x72\xc6\x4b\xc6") + attr(0x0012, bytes(8)) + data
+    return struct.pack(">HH", t, len(body)) + bytes(16) + body
+
+
+class RelayWrapping(unittest.TestCase):
+    def test_wrapper_sizes_match_e2(self):
+        game = b"g" * 85
+        ind = gturn(0x0115, game, outbound=False)
+        self.assertEqual(len(ind) - len(game), 44)
+        t, inner = ev.unwrap_gturn(ind)
+        self.assertEqual((t, inner), (0x0115, game))
+        reply = stun_payload(2, bytes(range(16)), 68)
+        req = gturn(0x0004, reply, outbound=True)
+        self.assertEqual(len(req) - len(reply), 64)
+        self.assertEqual(ev.unwrap_gturn(req)[1], reply)
+
+    def test_rejects_plain_stun_and_game_data(self):
+        self.assertIsNone(ev.unwrap_gturn(stun_payload(0, bytes(range(16)), 56)))  # no DATA/cookie
+        self.assertIsNone(ev.unwrap_gturn(b"\x00\x02\x05" + bytes(94)))
+        bad = bytearray(gturn(0x0115, b"g" * 85, outbound=False))
+        bad[3] += 4  # length field no longer matches
+        self.assertIsNone(ev.unwrap_gturn(bytes(bad)))
+
+    def test_sibling_report_unwraps_and_times_relayed_checks(self):
+        relay_stun, relay_wrap = ("203.0.113.148", 4379), ("203.0.113.148", 4380)
+        udps = []
+        for k in range(5):
+            t = T0 + k * 500 * MS
+            tx = k.to_bytes(16, "big")
+            udps.append(ev.Udp(t, relay_wrap, LOCAL, 100, gturn(0x0115, stun_payload(0, tx, 56), False)))
+            udps.append(ev.Udp(t + MS // 10, LOCAL, relay_wrap, 132, gturn(0x0004, stun_payload(2, tx, 68), True)))
+            udps.append(ev.Udp(t + 2 * MS, relay_wrap, LOCAL, 129, gturn(0x0115, b"g" * 85, False)))
+            udps.append(ev.Udp(t + 3 * MS, LOCAL, relay_stun, 97, b"x" * 97))  # the analysed endpoint itself
+        (sib,) = ev.sibling_report(udps, relay_stun)
+        self.assertEqual(sib["endpoint"], "203.0.113.x:4380")
+        self.assertEqual(sib["recv"]["overhead_bytes"], {44: 10})
+        self.assertEqual(sib["send"]["overhead_bytes"], {64: 5})
+        self.assertEqual(sib["recv"]["inner_sizes"], {"56": 5, "85": 5})
+        self.assertEqual(sib["relayed_check_turnaround_ms"]["n"], 5)
+        self.assertAlmostEqual(sib["relayed_check_turnaround_ms"]["median"], 0.1)
+
+
+class EndpointChoice(unittest.TestCase):
+    def make_db(self, d, events, states, rtt_eps):
+        path = os.path.join(d, "r.sqlite")
+        c = sqlite3.connect(path)
+        c.executescript(
+            "CREATE TABLE event (t_ns INTEGER, kind TEXT, detail TEXT);"
+            "CREATE TABLE p2p_state (t_ns INTEGER, steam_id INTEGER, active INTEGER, connecting INTEGER,"
+            " error INTEGER, using_relay INTEGER, bytes_queued INTEGER, packets_queued INTEGER,"
+            " remote_ip TEXT, remote_port INTEGER);"
+            "CREATE TABLE rtt (t_ns INTEGER, steam_id INTEGER, remote_ip TEXT, remote_port INTEGER,"
+            " rtt_ms REAL, source TEXT);"
+        )
+        c.executemany("INSERT INTO event VALUES (0, ?, ?)", events)
+        c.executemany("INSERT INTO p2p_state VALUES (0,1,1,0,0,?,0,0,?,?)", states)
+        for (ip, port), n in rtt_eps.items():
+            c.executemany("INSERT INTO rtt VALUES (0,1,?,?,1.0,'etw_stun')", [(ip, port)] * n)
+        c.commit()
+        return c
+
+    def test_e2_mode_reported_remote_is_the_relay(self):
+        with tempfile.TemporaryDirectory() as d:
+            c = self.make_db(
+                d,
+                [("relay_evidence", "1 F=0 P=1 A=? L=1 relayed=1 remote=203.0.113.148:4379"),
+                 ("relay_attributed", "1 203.0.113.148:4380")],
+                [(0, "203.0.113.148", 4379)],
+                {("203.0.113.148", 4379): 50},
+            )
+            self.assertEqual(ev.db_endpoint(c), (("203.0.113.148", 4379), "relay"))
+            c.close()
+
+    def test_e1_mode_and_direct(self):
+        with tempfile.TemporaryDirectory() as d:
+            c = self.make_db(
+                d,
+                [("relay_attributed", "1 203.0.113.134:4380"), ("relay_attributed", "1 203.0.113.134:4381")],
+                [(1, "198.51.100.20", 27015)],
+                {("203.0.113.134", 4380): 40},
+            )
+            self.assertEqual(ev.db_endpoint(c), (("203.0.113.134", 4380), "relay"))
+            c.close()
+        with tempfile.TemporaryDirectory() as d:
+            c = self.make_db(d, [], [(0, PEER[0], PEER[1])], {PEER: 10})
+            self.assertEqual(ev.db_endpoint(c), (PEER, "peer"))
+            c.close()
+
+
 class EndToEnd(unittest.TestCase):
     def test_capture_and_run_database(self):
         frames, rows = [], []

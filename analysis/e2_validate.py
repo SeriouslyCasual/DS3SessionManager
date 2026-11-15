@@ -28,10 +28,13 @@ What it reports:
 5. A traffic profile per direction (packets/s by payload size), to
    characterise relayed sessions; `--baseline` prints the per-size change
    against a previous run's JSON.
+6. For relayed runs, the other ports on the relay's IP: relay-wrapped
+   packets are unwrapped and profiled by their inner size, and the local
+   turnaround for the other player's relayed checks is measured.
 
-The endpoint (peer, or Valve relay for relayed runs) comes from the run
-database: the `relay_attributed` event if there is one, else the peer
-endpoint Steam reported. `--endpoint` overrides it.
+The endpoint comes from the run database: of the endpoints Steam reported
+and those ds3sm attributed to a relay, the one with the most RTT samples.
+`--endpoint` overrides it.
 
 Only the Python standard library is used. Printed endpoints are cut to /24
 (`a.b.c.x`), because captures and run databases hold real addresses; the
@@ -323,6 +326,113 @@ def stun_header(method: int, cls: int, txid: bytes, body_len: int = 0) -> bytes:
 
 
 # ---------------------------------------------------------------------------
+# Relay wrapping (E2 relay mode)
+# ---------------------------------------------------------------------------
+# On a relayed session in E2 mode, the other player's packets arrive from a
+# second port on the relay's IP, wrapped in a pre-TURN relay message in the
+# RFC 3489 style (as in libjingle's GTURN): a data indication (type 0x0115)
+# carrying a relay cookie (0x000F), the source address (0x0012) and the
+# original packet in a DATA attribute (0x0013). Packets sent that way are
+# send requests (0x0004) with cookie, username (0x0006), destination
+# (0x0011) and DATA.
+
+GTURN_DATA = 0x0013
+GTURN_COOKIE_ATTR = 0x000F
+
+
+def unwrap_gturn(payload: bytes) -> tuple[int, bytes] | None:
+    """Return (message type, inner packet) for a relay-wrapped packet, else None.
+
+    Strict: exact length field, attributes that tile the body, and both a
+    relay cookie and a DATA attribute present. Steam's relay doesn't pad the
+    last attribute to 4 bytes (a 129-byte packet carries 85 bytes of data),
+    so the final attribute may end unpadded.
+    """
+    if len(payload) < 20:
+        return None
+    t, mlen = struct.unpack_from(">HH", payload, 0)
+    if t & 0xC000 or mlen + 20 != len(payload):
+        return None
+    i, data, cookie = 20, None, False
+    while i < len(payload):
+        if i + 4 > len(payload):
+            return None
+        at, alen = struct.unpack_from(">HH", payload, i)
+        end = i + 4 + alen
+        if end > len(payload):
+            return None
+        if at == GTURN_DATA:
+            data = payload[i + 4 : end]
+        elif at == GTURN_COOKIE_ATTR:
+            cookie = True
+        i = end if end == len(payload) else i + 4 + ((alen + 3) & ~3)
+    if i != len(payload) or data is None or not cookie:
+        return None
+    return t, bytes(data)
+
+
+def sibling_report(udps: list[Udp], endpoint: tuple[str, int]) -> list[dict]:
+    """Profile the other ports on the endpoint's IP (relay siblings).
+
+    For each: packets/s each way, raw and unwrapped size histograms, wrapper
+    overhead, message types, and the local turnaround for relayed checks
+    (the other player's binding request, unwrapped, to our response, by
+    transaction ID).
+    """
+    by_port: dict[tuple[str, int], list[tuple[int, str, Udp]]] = defaultdict(list)
+    for u in udps:
+        if u.dst[0] == endpoint[0] and u.dst != endpoint:
+            by_port[u.dst].append((u.t_ns, SEND, u))
+        elif u.src[0] == endpoint[0] and u.src != endpoint:
+            by_port[u.src].append((u.t_ns, RECV, u))
+    out = []
+    for ep, pk in sorted(by_port.items()):
+        pk.sort(key=lambda x: x[0])
+        dur = max((pk[-1][0] - pk[0][0]) / 1e9, 1e-9)
+        d: dict = {"endpoint": mask(ep), "duration_s": dur}
+        pending: dict[bytes, int] = {}
+        turnaround = []
+        for direction in (SEND, RECV):
+            raw: Counter[int] = Counter()
+            inner: Counter[int] = Counter()
+            types: Counter[str] = Counter()
+            overhead: Counter[int] = Counter()
+            for _, dd, u in pk:
+                if dd != direction:
+                    continue
+                raw[u.size] += 1
+                w = unwrap_gturn(u.payload)
+                if w is None:
+                    types["unwrapped"] += 1
+                    continue
+                t, data = w
+                types[f"0x{t:04x}"] += 1
+                inner[len(data)] += 1
+                overhead[u.size - len(data)] += 1
+            n = sum(raw.values())
+            d[direction] = {
+                "packets": n,
+                "pps": n / dur,
+                "types": dict(types),
+                "overhead_bytes": dict(overhead),
+                "raw_sizes": {str(s): c for s, c in raw.most_common(10)},
+                "inner_sizes": {str(s): c for s, c in inner.most_common(10)},
+            }
+        for t_ns, dd, u in pk:
+            w = unwrap_gturn(u.payload)
+            s = parse_stun(w[1], scan=False) if w else None
+            if s is None:
+                continue
+            if dd == RECV and s.cls == 0:
+                pending.setdefault(s.txid, t_ns)
+            elif dd == SEND and s.cls == 2 and s.txid in pending:
+                turnaround.append((t_ns - pending.pop(s.txid)) / 1e6)
+        d["relayed_check_turnaround_ms"] = summarize(turnaround)
+        out.append(d)
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Per-endpoint datagrams
 # ---------------------------------------------------------------------------
 
@@ -552,22 +662,37 @@ class EtwSample:
 
 
 def db_endpoint(db: sqlite3.Connection) -> tuple[tuple[str, int], str]:
-    """Pick the endpoint to analyse: the attributed relay, else the direct peer."""
-    rows = db.execute("SELECT detail FROM event WHERE kind = 'relay_attributed' ORDER BY t_ns").fetchall()
-    eps = {r[0].split()[-1] for r in rows}
-    if len(eps) == 1:
-        return parse_endpoint(eps.pop()), "relay"
-    if len(eps) > 1:
-        raise SystemExit("several relay endpoints were attributed; choose one with --endpoint")
-    rows = db.execute(
-        "SELECT s.remote_ip, s.remote_port, "
-        "(SELECT COUNT(*) FROM rtt r WHERE r.remote_ip = s.remote_ip AND r.remote_port = s.remote_port) AS n "
-        "FROM p2p_state s WHERE s.using_relay = 0 AND s.remote_ip IS NOT NULL "
-        "GROUP BY s.remote_ip, s.remote_port ORDER BY n DESC"
-    ).fetchall()
-    if not rows:
-        raise SystemExit("no direct peer endpoint in the run database; pass --endpoint")
-    return (rows[0][0], int(rows[0][1])), "peer"
+    """Pick the endpoint to analyse: the one carrying the RTT samples.
+
+    Candidates are the endpoints Steam reported for peers and every endpoint
+    ds3sm attributed to a relay (`relay_attributed`, detail `<id> <ip:port>`).
+    The one with the most RTT rows wins. It's labelled "relay" if ds3sm
+    attributed it, or judged Steam's reported remote to be a relay
+    (`relay_evidence ... relayed=1 remote=<ip:port>`, E2 mode).
+    """
+    relay_eps = {
+        r[0].split()[1]
+        for r in db.execute("SELECT detail FROM event WHERE kind = 'relay_attributed'")
+        if len(r[0].split()) >= 2
+    }
+    for (d,) in db.execute("SELECT detail FROM event WHERE kind = 'relay_evidence'"):
+        parts = dict(p.split("=", 1) for p in d.split() if "=" in p)
+        remote_is_relay = any(parts.get(k) == "1" for k in ("P", "A", "L"))
+        if parts.get("relayed") == "1" and remote_is_relay and parts.get("remote", "-") != "-":
+            relay_eps.add(parts["remote"])
+    cands = {f"{ip}:{port}" for ip, port in db.execute(
+        "SELECT DISTINCT remote_ip, remote_port FROM p2p_state WHERE remote_ip IS NOT NULL"
+    )}
+    cands |= relay_eps
+    if not cands:
+        raise SystemExit("no peer or relay endpoint in the run database; pass --endpoint")
+
+    def n_rtt(ep: str) -> int:
+        ip, port = parse_endpoint(ep)
+        return db.execute("SELECT COUNT(*) FROM rtt WHERE remote_ip = ? AND remote_port = ?", (ip, port)).fetchone()[0]
+
+    best = max(sorted(cands), key=n_rtt)
+    return parse_endpoint(best), "relay" if best in relay_eps else "peer"
 
 
 def load_etw(db: sqlite3.Connection, ep: tuple[str, int]) -> list[EtwSample]:
@@ -804,6 +929,23 @@ def print_report(r: dict, baseline: dict | None) -> None:
             p(f"  {d}: {x['pps']:.2f} pps, {x['bytes_per_s']:.0f} B/s")
             for s, v in x["sizes"].items():
                 p(f"    {s:>5} B  {v['pps']:6.2f} pps  ({v['count']})")
+    for sib in r.get("siblings", []):
+        # Skip incidental chatter (e.g. mDNS from a LAN peer); the JSON keeps it.
+        wrapped = any(k != "unwrapped" for d in (SEND, RECV) for k in sib[d]["types"])
+        total = sib[SEND]["packets"] + sib[RECV]["packets"]
+        if not wrapped and total / max(pr.get("duration_s", 1.0), 1.0) < 1.0:
+            continue
+        p(f"\nOther port on the endpoint's IP: {sib['endpoint']} over {sib['duration_s']:.1f} s")
+        for d in (SEND, RECV):
+            x = sib[d]
+            if not x["packets"]:
+                continue
+            p(f"  {d}: {x['pps']:.2f} pps, message types {x['types']}, wrapper bytes {x['overhead_bytes']}")
+            p(f"    raw sizes   {x['raw_sizes']}")
+            if x["inner_sizes"]:
+                p(f"    inner sizes {x['inner_sizes']}")
+        if sib["relayed_check_turnaround_ms"]:
+            p(_line("local turnaround for relayed checks", sib["relayed_check_turnaround_ms"], "ms", 4))
     if baseline and baseline.get("profile"):
         p("\nChange against baseline (pps, this minus baseline):")
         for d in (SEND, RECV):
@@ -840,7 +982,7 @@ def _analyse(capture: str, db: sqlite3.Connection | None, endpoint: tuple[str, i
             raise SystemExit("without a run database, --endpoint is required")
         endpoint, kind = db_endpoint(db)
     info = CaptureInfo()
-    udps = (u for u in (decode_udp(f) for f in read_capture(capture, info)) if u is not None)
+    udps = [u for u in (decode_udp(f) for f in read_capture(capture, info)) if u is not None]
     dg = to_dgrams(udps, endpoint)
     truth = pair_by_txid(dg)
     rule, lost, unmatched = size_rule_pairs(dg)
@@ -867,6 +1009,7 @@ def _analyse(capture: str, db: sqlite3.Connection | None, endpoint: tuple[str, i
         "size_rule": size_rule_quality(dg),
         "pairing": acc,
         "profile": profile(dg),
+        "siblings": sibling_report(udps, endpoint),
     }
     if db is not None:
         etw_all = load_etw(db, endpoint)
