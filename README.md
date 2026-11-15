@@ -13,7 +13,7 @@ DS3SessionManager is a free Windows tool that runs alongside Dark Souls III. For
 - **Ping** (round-trip time), updated continuously, with median and worst-case (95th percentile).
 - **Jitter**: how much the ping wobbles.
 - **Packet loss estimate.**
-- **Direct vs. Steam relay** connection.
+- **Direct vs. Steam relay** connection, detected even when Steam itself doesn't flag the relay. For relayed players it also shows the relay server's location (not the player's) and the traffic on each relay connection.
 - **Region and distance**, estimated from an offline IP-location database. Your peers' IPs are never sent to any website.
 - **Fastest possible ping** for that distance, and how far above it the real ping is. This is handy for spotting bad routes.
 - Session logging to a local file, plus an anonymized export.
@@ -44,6 +44,7 @@ As with any third-party tool: use it at your own risk. This project isn't affili
 - Steam, and Dark Souls III on Steam
 - **Run as administrator** for ping measurement. Windows only lets administrators read network timing. Without admin rights, use `--no-etw`: you still see who's connected, but not their ping.
 - Optional, for regions: the free **DB-IP "IP to City Lite"** database (MMDB format) from <https://db-ip.com/db/download/ip-to-city-lite>, saved as `geo/dbip-city-lite.mmdb` next to the program.
+- Optional, for better relay detection and network names: the free **DB-IP "IP to ASN Lite"** database (MMDB format) from <https://db-ip.com/db/download/ip-to-asn-lite>, saved as `geo/dbip-asn-lite.mmdb`.
 
 ## Building from source
 
@@ -76,16 +77,22 @@ The program is `target\release\ds3sm.exe`. The build places the required `steam_
 | Column | Meaning |
 |---|---|
 | `st` | `A` = connected, `C` = connecting |
-| `relay` | `yes` if Steam is routing the connection through a Valve relay server |
-| `last` / `med` / `p95` | Latest, typical and worst-case ping in milliseconds |
+| `relay` | `no` = direct. `yes*` = going through a Valve relay server, and ds3sm found the relay's connections. `yes` = Steam says it's relayed, but the relay wasn't found. |
+| `via` | Which signs of a relay were seen: `F` Steam's own flag, `P` the traffic pattern, `A` the network owner (needs the ASN database), `L` ds3sm's built-in list of Valve relay addresses. `-` = none. |
+| `remote` | The address the ping is measured to: the player, or the relay server |
+| `last` / `med` / `p95` | Latest, typical and worst-case ping in milliseconds. Through a relay, this is the full round trip to the player and back, not just to the relay. |
 | `sd` / `ipdv` | Two measures of jitter (ms). Lower is smoother. |
 | `nrep%` | Share of Steam's connection checks that got no reply: a loss estimate |
-| `pps_in` / `pps_out` | Packets per second to and from that player |
-| `cc` / `km` | Estimated country and distance |
+| `pps_in` / `pps_out` | Packets per second to and from that player (all relay connections included) |
+| `cc` / `km` | Estimated country and distance. `R:fra` (a relay site code, here Frankfurt) means it's the **relay server's** location, not the player's. |
 | `bound` | Fastest physically possible ping for that distance |
-| `infl` | Actual ping ÷ fastest possible. Around 2–4 is normal; much higher suggests a long route, a relay or a VPN. |
+| `infl` | Actual ping ÷ fastest possible. Around 2–4 is normal; much higher suggests a long route, a relay or a VPN. Left blank when only the relay's location is known. |
 
 `-` means "not available for this connection". The tool never guesses.
+
+For a relayed player, a **Relay for …** section below the table lists each relay connection: its role, the relay site, packets per second, data sent and received, and an estimate of the game data with the relay's own headers removed.
+
+Steam doesn't always say when it relays a connection, so ds3sm treats a player as relayed if any of the signs in `via` appear. To choose which signs count, use for example `--relay-detect F,L`. All four are always recorded in the session log.
 
 ## Troubleshooting
 
@@ -100,7 +107,8 @@ The program is `target\release\ds3sm.exe`. The build places the required `steam_
 ## Credits
 
 - Inspired by **DS3ConnectionInfo** and **SteamP2PInfo** by tremwil. Their ideas showed this was possible. No code from them is used.
-- IP geolocation by [DB-IP](https://db-ip.com) (CC BY 4.0).
+- IP geolocation and network data by [DB-IP](https://db-ip.com) (CC BY 4.0).
+- Valve's address space from [RIPEstat](https://stat.ripe.net), and Steam relay site locations from Steam's public relay network configuration.
 - Developed in part as a networking research project. Research notes and progress logs are on the [project site](https://seriouslycasual.github.io/DS3SessionManager/).
 
 See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
