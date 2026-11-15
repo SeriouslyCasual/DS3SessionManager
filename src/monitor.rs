@@ -1006,16 +1006,26 @@ fn log_traffic(
                 relay::payload_estimate(r, tr.bytes_in, tr.pkts_in, tr.bytes_out, tr.pkts_out)
             }),
             max_gap_in_ms: tr.max_gap_in_ns as f64 / 1e6,
-            jit_in: stream_stats(&tr.jit_in),
-            jit_out: stream_stats(&tr.jit_out),
+            jit_in: stream_stats(&tr.jit_in, t),
+            jit_out: stream_stats(&tr.jit_out, t),
             stun: matcher.counters(ep),
         })?;
     }
     Ok(())
 }
 
-/// A stream's jitter, size and period for the log, once it has a value.
-fn stream_stats(j: &StreamJitter) -> Option<StreamStats> {
+/// A stream older than this at logging time is left out of the row, so an
+/// endpoint that went quiet (after a path change, say) doesn't repeat its
+/// last jitter forever. One log interval: a live 12 Hz stream always has a
+/// packet within it, even with ETW's ~1 s batch delay.
+const STREAM_STALE_NS: i128 = 5_000_000_000;
+
+/// A stream's jitter, size and period for the log, once it has a value and
+/// while it is still receiving packets.
+fn stream_stats(j: &StreamJitter, t_now: i128) -> Option<StreamStats> {
+    if t_now - j.last_ns()? > STREAM_STALE_NS {
+        return None;
+    }
     Some(StreamStats {
         jitter_ms: j.jitter_ms()?,
         size: j.size()?,
@@ -1539,6 +1549,21 @@ mod tests {
     fn missing_steam_pid_matches_nothing() {
         let (peer, m) = peer_map();
         assert!(!counts_packet(STEAM, peer, GAME, u32::MAX, &m));
+    }
+
+    /// E3 Block C: an endpoint abandoned after a relay switch kept logging
+    /// its last jitter in every row; a quiet stream is now left out.
+    #[test]
+    fn a_quiet_stream_is_not_logged() {
+        let mut j = StreamJitter::default();
+        let period = 83_333_333;
+        for i in 0..20 {
+            j.observe(85, i * period);
+        }
+        let last = 19 * period;
+        assert!(stream_stats(&j, last + 1_000_000_000).is_some());
+        assert!(stream_stats(&j, last + STREAM_STALE_NS).is_some());
+        assert!(stream_stats(&j, last + STREAM_STALE_NS + 1).is_none());
     }
 }
 

@@ -14,11 +14,21 @@
 //! D = inter-arrival - k*T,   k = round(inter-arrival / T)
 //! ```
 //!
-//! - `T` is the median of the last 64 inter-arrival times (the sender's
-//!   period, learned from the stream itself).
+//! - `T` is the median of the last 64 per-slot inter-arrival times (the
+//!   sender's period, learned from the stream itself). Until `T` is known the
+//!   raw gaps are used. After that each gap goes in as `gap / k`, so a gap
+//!   that spans k slots counts as k slots, not as one long period. Without
+//!   this, heavy loss drags `T` up: at about 50 % loss most gaps are 2T or
+//!   longer, the median doubles, and jitter reads about T/2 on a clean
+//!   stream (seen in E3 at 50 % injected loss: 45–65 ms instead of 0.3 ms).
+//!   A gap with k = 0 (an extra packet) is left out of the period.
 //! - `k` absorbs a lost packet (gap of about 2T, so k = 2 and D is about 0),
 //!   which keeps loss and jitter separate. An extra packet of the same size
 //!   between two slots gets k = 0, so it counts as its offset, not as a gap.
+//! - The period follows changes of less than half a slot (e.g. 12 → 10 Hz);
+//!   a sender that halves its rate looks like 50 % loss and keeps the old
+//!   `T`, which still gives the right jitter. A stream that *starts* under
+//!   heavy loss can learn a multiple of the true period.
 //! - Delays above T/2 (about 42 ms at 12 Hz) can't be told apart from a
 //!   missing or extra packet; the largest inbound gap shows those.
 //!
@@ -50,7 +60,7 @@ pub struct StreamJitter {
     size: Option<u32>,
     /// Arrival (or send) time of the last packet of that size, ns.
     last_ns: Option<i128>,
-    /// Recent inter-arrival times, ms.
+    /// Recent per-slot inter-arrival times (gap / k once `T` is known), ms.
     iats: VecDeque<f64>,
     jitter_ms: f64,
     /// Number of D values fed into `jitter_ms`.
@@ -88,19 +98,26 @@ impl StreamJitter {
         }
         self.last_ns = Some(t_ns);
         let iat = (t_ns - prev) as f64 / 1e6;
-        if let Some(t) = self.period_ms() {
-            let k = (iat / t).round();
-            let d = iat - k * t;
-            self.jitter_ms += (d.abs() - self.jitter_ms) / GAIN;
-            self.samples += 1;
+        let slot = match self.period_ms() {
+            Some(t) => {
+                let k = (iat / t).round();
+                let d = iat - k * t;
+                self.jitter_ms += (d.abs() - self.jitter_ms) / GAIN;
+                self.samples += 1;
+                // Per-slot gap for the period; an extra packet (k = 0) has none.
+                (k >= 1.0).then(|| iat / k)
+            }
+            None => Some(iat),
+        };
+        if let Some(s) = slot {
+            if self.iats.len() == PERIOD_WINDOW {
+                self.iats.pop_front();
+            }
+            self.iats.push_back(s);
         }
-        if self.iats.len() == PERIOD_WINDOW {
-            self.iats.pop_front();
-        }
-        self.iats.push_back(iat);
     }
 
-    /// The sender's period `T` (median inter-arrival), once enough are known.
+    /// The sender's period `T` (median per-slot gap), once enough are known.
     pub fn period_ms(&self) -> Option<f64> {
         if self.iats.len() < MIN_PERIOD_SAMPLES {
             return None;
@@ -236,6 +253,50 @@ mod tests {
         assert_eq!(j.size(), Some(129));
         assert!(j.jitter_ms().unwrap() < 1e-6);
         assert_eq!(j.last_ns(), Some(t - T));
+    }
+
+    /// E3 Block C: 50 % injected loss each way left ~40 % of the stream.
+    /// Keeping 2 slots in 5 (gaps 3T, 2T, 3T, ...) used to move the median
+    /// gap to 2.5T and jitter to ~40 ms; per-slot gaps keep T and J at 0.
+    #[test]
+    fn heavy_loss_keeps_the_period() {
+        let mut j = StreamJitter::default();
+        let t = feed(&mut j, 85, 0, 100, |_| 0);
+        for i in 0..500 {
+            if i % 5 == 0 || i % 5 == 3 {
+                j.observe(85, t + i * T);
+            }
+        }
+        assert!((j.period_ms().unwrap() - 83.333).abs() < 0.01);
+        assert!(j.jitter_ms().unwrap() < 1e-6, "{:?}", j.jitter_ms());
+    }
+
+    /// The same loss with ±1 ms alternating delay: J stays near the clean
+    /// stream's value instead of jumping to tens of ms.
+    #[test]
+    fn heavy_loss_with_jitter_reads_the_jitter() {
+        let mut j = StreamJitter::default();
+        let d = |i: i128| if i % 2 == 0 { MS } else { -MS };
+        let t = feed(&mut j, 85, 0, 100, d);
+        for i in 0..800 {
+            if i % 5 == 0 || i % 5 == 3 {
+                j.observe(85, t + i * T + d(i));
+            }
+        }
+        let v = j.jitter_ms().unwrap();
+        assert!(v < 2.5, "{v}");
+    }
+
+    /// A small rate change (12 → 10 Hz) is followed.
+    #[test]
+    fn the_period_follows_a_small_rate_change() {
+        let mut j = StreamJitter::default();
+        let t = feed(&mut j, 85, 0, 100, |_| 0);
+        for i in 0..200 {
+            j.observe(85, t + i * 100 * MS);
+        }
+        assert!((j.period_ms().unwrap() - 100.0).abs() < 0.01);
+        assert!(j.jitter_ms().unwrap() < 0.5, "{:?}", j.jitter_ms());
     }
 
     #[test]

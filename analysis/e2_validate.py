@@ -1021,12 +1021,15 @@ JIT_MATCH_WINDOW_NS = 3_000_000_000
 class StreamJitter:
     """RFC 3550 jitter on the dominant packet size, D = IAT - k*T.
 
-    Same rules as ds3sm: T is the median of the last 64 inter-arrival times
-    (at least 8), k = round(IAT / T) (half away from zero, as Rust rounds),
+    Same rules as ds3sm: T is the median of the last 64 per-slot gaps (at
+    least 8; raw gaps until T is known, then IAT / k, with k = 0 left out),
+    k = round(IAT / T) (half away from zero, as Rust rounds),
     J += (|D| - J) / 16, and a new dominant size restarts the estimate.
+    `per_slot=False` gives the pre-E3 rule (raw gaps), kept for comparison.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, per_slot: bool = True) -> None:
+        self.per_slot = per_slot
         self.counts: Counter[int] = Counter()
         self.size: int | None = None
         self.last_ns: int | None = None
@@ -1057,18 +1060,24 @@ class StreamJitter:
         iat = (t_ns - self.last_ns) / 1e6
         self.last_ns = t_ns
         t = self.period_ms()
+        slot: float | None = iat
         if t is not None:
             k = float(int(iat / t + 0.5))
             self.jitter_ms += (abs(iat - k * t) - self.jitter_ms) / JIT_GAIN
             self.samples += 1
-        self.iats.append(iat)
-        if len(self.iats) > JIT_PERIOD_WINDOW:
-            del self.iats[0]
+            if self.per_slot:
+                slot = iat / k if k >= 1 else None
+        if slot is not None:
+            self.iats.append(slot)
+            if len(self.iats) > JIT_PERIOD_WINDOW:
+                del self.iats[0]
 
 
-def jitter_track(pkts: list[tuple[int, int]]) -> tuple[StreamJitter, list[tuple[int, float]]]:
+def jitter_track(
+    pkts: list[tuple[int, int]], per_slot: bool = True
+) -> tuple[StreamJitter, list[tuple[int, float]]]:
     """Run the estimator over (t_ns, size) packets; return it and J after each packet."""
-    j = StreamJitter()
+    j = StreamJitter(per_slot)
     track = []
     for t_ns, size in pkts:
         j.observe(size, t_ns)
