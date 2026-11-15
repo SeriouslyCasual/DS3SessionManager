@@ -94,6 +94,34 @@ class StunParsing(unittest.TestCase):
         self.assertIsNone(ev.parse_stun(bytes(bad)))
         self.assertIsNone(ev.parse_stun(stun_payload(0, txid(1), 20)[:19]))
 
+    def test_classic_rfc3489_steam_layout(self):
+        # Layout seen in E2: request 0x0001 + USERNAME(32) = 56 B;
+        # response 0x0101 + USERNAME(32) + MAPPED-ADDRESS(8) = 68 B.
+        tx = bytes(range(16))
+        user = struct.pack(">HH", 0x0006, 32) + b"u" * 32
+        mapped = struct.pack(">HH", 0x0001, 8) + bytes([0, 1, 0x1F, 0x90, 192, 0, 2, 10])
+        rq = struct.pack(">HH", 0x0001, len(user)) + tx + user
+        rs = struct.pack(">HH", 0x0101, len(user + mapped)) + tx + user + mapped
+        self.assertEqual((len(rq), len(rs)), (56, 68))
+        a, b = ev.parse_stun(rq), ev.parse_stun(rs)
+        self.assertEqual((a.rfc, a.cls, a.txid), (3489, 0, tx))
+        self.assertEqual((b.rfc, b.cls, b.txid), (3489, 2, tx))
+
+    def test_classic_round_trip_helper(self):
+        s = ev.parse_stun(stun_payload(2, bytes(16), 68))
+        self.assertEqual((s.rfc, s.cls, len(s.txid)), (3489, 2, 16))
+
+    def test_classic_rejects_near_misses(self):
+        good = stun_payload(0, bytes(range(16)), 56)
+        wrong_len = good[:2] + struct.pack(">H", 40) + good[4:]
+        self.assertIsNone(ev.parse_stun(wrong_len))
+        ragged = good[:20] + struct.pack(">HH", 0x0006, 40) + good[24:]  # attr overruns the payload
+        self.assertIsNone(ev.parse_stun(ragged))
+        other_method = struct.pack(">H", 0x0003) + good[2:]
+        self.assertIsNone(ev.parse_stun(other_method))
+        # Game packets start 00 xx xx with random bytes after: not STUN.
+        self.assertIsNone(ev.parse_stun(b"\x00\x02\x05" + bytes(range(94))))
+
     def test_wrapped_header_is_found_by_scan(self):
         p = b"\xAB" * 8 + stun_payload(0, txid(3), 40)
         s = ev.parse_stun(p)

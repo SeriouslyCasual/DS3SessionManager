@@ -12,9 +12,11 @@ Inputs:
   (`-` skips it); without it only the capture-side checks run.
 
 What it reports:
-1. STUN messages found in the capture (RFC 8489 header: magic cookie
-   0x2112A442), paired request -> response by the 96-bit transaction ID.
-   That is the ground truth.
+1. STUN messages found in the capture, paired request -> response by
+   transaction ID. That is the ground truth. RFC 8489 messages are found by
+   the magic cookie 0x2112A442 (96-bit ID); classic RFC 3489 messages (no
+   cookie, 128-bit ID) by a strict header and attribute check. E2's first
+   capture showed Steam's checks use the classic format.
 2. Precision and recall of ds3sm's size rule ("a 56-byte send is a STUN
    request, a 68-byte receive is a reply"), and the STUN sizes it misses.
 3. The size rule's pairing (oldest outstanding request, 2 s timeout) replayed
@@ -244,15 +246,50 @@ class Stun:
     cls: int
     txid: bytes
     exact_len: bool  # header length field + 20 == bytes after the header start
+    rfc: int = 8489  # 8489 (magic cookie, 96-bit ID) or 3489 (classic, 128-bit ID)
+
+
+def _attrs_fill(payload: bytes, start: int) -> bool:
+    """True if type-length-value attributes from `start` end exactly at the payload end."""
+    i = start
+    while i + 4 <= len(payload):
+        alen = struct.unpack_from(">H", payload, i + 2)[0]
+        i += 4 + ((alen + 3) & ~3)
+    return i == len(payload)
+
+
+def parse_stun_classic(payload: bytes) -> Stun | None:
+    """Parse a classic RFC 3489 STUN message (no magic cookie, 128-bit transaction ID).
+
+    E2 showed that Steam's 56/68-byte connectivity checks use this older
+    format. Without a cookie a random packet could look like a header, so
+    this is strict: binding method, length field matching the payload
+    exactly, and attributes that tile the body exactly.
+    """
+    if len(payload) < 20:
+        return None
+    t, mlen = struct.unpack_from(">HH", payload, 0)
+    if t & 0xC000 or mlen % 4 or mlen + 20 != len(payload):
+        return None
+    method = ((t & 0x3E00) >> 2) | ((t & 0x00E0) >> 1) | (t & 0x000F)
+    if method != BINDING or not _attrs_fill(payload, 20):
+        return None
+    cls = ((t & 0x0100) >> 7) | ((t & 0x0010) >> 4)
+    return Stun(0, method, cls, bytes(payload[4:20]), True, 3489)
 
 
 def parse_stun(payload: bytes, scan: bool = True) -> Stun | None:
-    """Parse an RFC 8489 STUN header.
+    """Parse a STUN header: RFC 8489 first, then classic RFC 3489.
 
-    The header normally starts at payload offset 0 (cookie at offset 4). If
-    `scan` is set and it isn't there, the payload is searched for the cookie
-    in case Steam wraps the message in its own framing.
+    The RFC 8489 header normally starts at payload offset 0 (cookie at
+    offset 4). If `scan` is set and it isn't there, the payload is searched
+    for the cookie in case Steam wraps the message in its own framing.
     """
+    s = _parse_stun_8489(payload, scan)
+    return s if s is not None else parse_stun_classic(payload)
+
+
+def _parse_stun_8489(payload: bytes, scan: bool) -> Stun | None:
     starts = [0]
     if scan:
         i = payload.find(COOKIE_BYTES, 5)
@@ -273,9 +310,15 @@ def parse_stun(payload: bytes, scan: bool = True) -> Stun | None:
 
 
 def stun_header(method: int, cls: int, txid: bytes, body_len: int = 0) -> bytes:
-    """Build a STUN header (used by the tests to make synthetic packets)."""
+    """Build a STUN header (used by the tests to make synthetic packets).
+
+    A 12-byte `txid` gives an RFC 8489 header (with the magic cookie); a
+    16-byte one gives a classic RFC 3489 header.
+    """
     t = (method & 0x000F) | ((method & 0x0070) << 1) | ((method & 0x0F80) << 2)
     t |= ((cls & 1) << 4) | ((cls & 2) << 7)
+    if len(txid) == 16:
+        return struct.pack(">HH", t, body_len) + txid
     return struct.pack(">HHI", t, body_len, STUN_COOKIE) + txid
 
 
@@ -450,6 +493,7 @@ def stun_inventory(dg: list[Dgram]) -> dict:
     """Every STUN message kind seen, by direction and size."""
     kinds: Counter[tuple[str, str, int]] = Counter()
     offsets: Counter[int] = Counter()
+    rfcs: Counter[str] = Counter()
     exact = total = 0
     for g in dg:
         if g.stun is None:
@@ -457,9 +501,11 @@ def stun_inventory(dg: list[Dgram]) -> dict:
         total += 1
         exact += g.stun.exact_len
         offsets[g.stun.offset] += 1
+        rfcs[f"RFC {g.stun.rfc}"] += 1
         kinds[(g.dir, _describe(g), g.size)] += 1
     return {
         "messages": total,
+        "formats": dict(rfcs),
         "header_offsets": dict(offsets),
         "length_field_exact": exact,
         "kinds": [{"dir": d, "kind": k, "size": s, "count": c} for (d, k, s), c in sorted(kinds.items())],
@@ -713,7 +759,7 @@ def print_report(r: dict, baseline: dict | None) -> None:
     p(f"Capture: {c['format']}, {c['frames']} frames, {c['udp_to_endpoint']} UDP packets to/from endpoint, "
       f"declared resolution {_f(c['declared_resolution_ns'], 0)} ns, smallest gap {c['smallest_gap_ns']} ns")
     inv = r["stun"]
-    p(f"\nSTUN in capture: {inv['messages']} messages, header offsets {inv['header_offsets']}, "
+    p(f"\nSTUN in capture: {inv['messages']} messages {inv['formats']}, header offsets {inv['header_offsets']}, "
       f"length field exact in {inv['length_field_exact']}")
     for k in inv["kinds"]:
         p(f"  {k['dir']:<4} {k['kind']:<28} {k['size']:>4} B  x{k['count']}")
