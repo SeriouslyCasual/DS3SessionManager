@@ -371,6 +371,13 @@ impl PeerView {
         v
     }
 
+    /// Whether `ep` is one of this peer's relay endpoints: an attributed one,
+    /// or Steam's reported remote when that is itself the relay (E2 mode).
+    fn is_relay_endpoint(&self, ep: &SocketAddrV4) -> bool {
+        self.relay_eps.contains(ep)
+            || (self.state.remote == Some(*ep) && self.relay_ip == Some(*ep.ip()))
+    }
+
     /// The endpoint carrying the 56/68-byte checks (most requests seen),
     /// i.e. the one the RTT samples come from.
     fn stun_endpoint(&self, matcher: &StunMatcher) -> Option<SocketAddrV4> {
@@ -692,14 +699,15 @@ fn stun_like(
 /// The relay step, after each Steam poll (rules in `relay.rs`):
 /// 1. run the four detectors for every live peer and log changes
 ///    (`relay_evidence`);
-/// 2. decide each relayed peer's relay IP (Steam's remote in E2 mode, the
-///    `pick` rule in E1 mode);
-/// 3. attribute every steam.exe endpoint on that IP to the peer, if no other
-///    live peer uses the same relay IP. Added endpoints go into
-///    `by_endpoint`, so from then on their packets count for the peer (pps,
-///    bytes, STUN RTT) exactly like a direct peer's. Each change is logged
-///    as `relay_attributed` / `relay_unattributed` (detail: `<id> <ip:port>`);
-/// 4. place the relay server (site and GeoIP) when the relay IP changes.
+/// 2. decide each relayed peer's relay host, the one carrying the RTT
+///    (Steam's remote in E2 mode, the `pick` rule in E1 mode);
+/// 3. if exactly one peer is relayed, attribute to it every endpoint
+///    `relay::relay_set` accepts, on any relay host or site. Added endpoints
+///    go into `by_endpoint`, so from then on their packets count for the
+///    peer (pps, bytes, STUN RTT) exactly like a direct peer's. Each change
+///    is logged as `relay_attributed` / `relay_unattributed` (detail:
+///    `<id> <ip:port>`);
+/// 4. place the relay host (site and GeoIP) when it changes.
 fn update_relays(
     active: &[(SteamId, P2PState)],
     peers: &mut HashMap<SteamId, PeerView>,
@@ -733,15 +741,25 @@ fn update_relays(
         keys.extend(v.relay_eps.iter().copied());
     }
     keys.extend(all_reported.iter().copied());
+    // A relay address: built-in list, or the ASN database says Valve.
+    let relay_addr = |ip: Ipv4Addr| {
+        valve::is_relay_address(ip)
+            || ctx.asn.is_some_and(|db| {
+                db.lookup(IpAddr::V4(ip))
+                    .is_some_and(|(n, _)| n == VALVE_ASN)
+            })
+    };
     let candidates: Vec<relay::Candidate> = keys
         .iter()
         .map(|&ep| {
             let (pin, pout) = ep_rates(&ep, traffic, side, t);
-            relay::Candidate {
+            relay::Candidate::new(
                 ep,
-                pps: pin + pout,
-                stun_like: stun_like(&ep, traffic, side),
-            }
+                pin,
+                pout,
+                stun_like(&ep, traffic, side),
+                relay_addr(*ep.ip()),
+            )
         })
         .collect();
 
@@ -781,7 +799,13 @@ fn update_relays(
         }
     }
 
-    // 2. Relay IP per peer.
+    // 2. Which peers are relayed, and the relay host shown for each (the
+    //    one carrying the RTT).
+    let relayed: Vec<SteamId> = active
+        .iter()
+        .map(|(id, _)| *id)
+        .filter(|id| peers.get(id).is_some_and(|v| v.evidence.relayed(&det)))
+        .collect();
     let flag_only: Vec<SteamId> = active
         .iter()
         .map(|(id, _)| *id)
@@ -805,22 +829,25 @@ fn update_relays(
             want_ip.insert(*id, *ep.ip());
         }
     }
-    let mut users: HashMap<Ipv4Addr, usize> = HashMap::new();
-    for ip in want_ip.values() {
-        *users.entry(*ip).or_default() += 1;
-    }
-
-    // 3 and 4. Attribute, and place the relay. Peers that left get nothing.
+    // 3 and 4. Attribute (only for the single relayed peer, if there is
+    // exactly one), and place the relay. Peers that left get nothing.
     for (id, view) in peers.iter_mut() {
         let ip = want_ip.get(id).copied();
-        let want = match ip {
-            Some(ip) if users.get(&ip) == Some(&1) => relay::group(
-                ip,
-                keys.iter().copied(),
+        let want = if relayed.len() == 1 && relayed[0] == *id {
+            let pick = if flag_only.first() == Some(id) {
+                e1_ep
+            } else {
+                None
+            };
+            relay::relay_set(
+                &candidates,
                 reported.get(id).copied(),
                 &others(id),
-            ),
-            _ => Vec::new(),
+                &view.relay_eps,
+                pick,
+            )
+        } else {
+            Vec::new()
         };
         if want != view.relay_eps {
             for old in view.relay_eps.iter().filter(|e| !want.contains(e)) {
@@ -914,7 +941,7 @@ fn log_traffic(
     for (ep, tr) in traffic {
         let owner = by_endpoint.get(ep).copied();
         let role = match owner.and_then(|id| peers.get(&id)) {
-            Some(v) if v.relay_ip == Some(*ep.ip()) => Some(Role::of(stun_like(ep, traffic, side))),
+            Some(v) if v.is_relay_endpoint(ep) => Some(Role::of(stun_like(ep, traffic, side))),
             _ => None,
         };
         let role_str = match (role, owner) {
@@ -1297,13 +1324,23 @@ fn draw(
             v.evidence.log_detail()
         ));
         out.push_str(&format!(
-            "  {:<21} {:<8} {:>6} {:>6} {:>9} {:>9} {:>11} {:>11}\n",
-            "endpoint", "role", "pps_in", "out", "KB_in", "KB_out", "payload_in", "payload_out"
+            "  {:<21} {:<8} {:<5} {:>6} {:>6} {:>9} {:>9} {:>11} {:>11}\n",
+            "endpoint",
+            "role",
+            "site",
+            "pps_in",
+            "out",
+            "KB_in",
+            "KB_out",
+            "payload_in",
+            "payload_out"
         ));
+        // Every relay endpoint, on any host or site (the two allocations
+        // of a relayed session can sit on different relay hosts).
         let mut eps: Vec<SocketAddrV4> = v
             .endpoints()
             .into_iter()
-            .filter(|e| *e.ip() == rip)
+            .filter(|e| v.is_relay_endpoint(e))
             .collect();
         eps.sort();
         for e in eps {
@@ -1328,10 +1365,12 @@ fn draw(
             } else {
                 "wrapped".into()
             };
+            let site = valve::site(*e.ip()).map(|p| p.code).unwrap_or("-");
             out.push_str(&format!(
-                "  {:<21} {:<8} {:>6.0} {:>6.0} {:>9} {:>9} {:>11} {:>11}\n",
+                "  {:<21} {:<8} {:<5} {:>6.0} {:>6.0} {:>9} {:>9} {:>11} {:>11}\n",
                 e.to_string(),
                 tag,
+                site,
                 pin,
                 pout,
                 kb(bi),
@@ -1346,20 +1385,15 @@ fn draw(
     }
 
     if etw_on && any_relayed {
-        // Game-like steam.exe endpoints that no peer claims (e.g. several
-        // relayed peers sharing one relay server).
+        // Game-rate steam.exe endpoints that no peer claims (e.g. with
+        // several relayed peers, whose relay traffic can't be split).
         let mut rows: Vec<(SocketAddrV4, f64, f64)> = side
             .traffic
             .keys()
-            .filter(|ep| !by_endpoint.contains_key(ep))
+            .filter(|ep| !by_endpoint.contains_key(ep) && ep.port() != relay::STUN_SERVER_PORT)
             .filter_map(|&ep| {
                 let (pin, pout) = ep_rates(&ep, traffic, side, t_now);
-                let c = relay::Candidate {
-                    ep,
-                    pps: pin + pout,
-                    stun_like: stun_like(&ep, traffic, side),
-                };
-                c.looks_like_game().then_some((ep, pin, pout))
+                (pin + pout >= relay::MIN_RELAY_PPS).then_some((ep, pin, pout))
             })
             .collect();
         rows.sort_by(|a, b| (b.1 + b.2).total_cmp(&(a.1 + a.2)));
@@ -1637,6 +1671,50 @@ mod relay_step_tests {
         r.step(&[(id, state(false, relay(4379)))], "F");
         assert!(r.peers[&id].relay_eps.is_empty());
         assert!(r.peers[&id].relay_ip.is_none());
+    }
+
+    /// Test 3b layout: Steam's remote on one relay host, the wrapped inbound
+    /// on another host at the same site.
+    #[test]
+    fn e2_layout_across_two_relay_hosts() {
+        let mut r = Rig::new("twohost");
+        let id = SteamId(1);
+        let other_host = SocketAddrV4::new(Ipv4Addr::new(205, 196, 6, 2), 4380);
+        r.traffic.insert(relay(4379), tr(2, 33, true));
+        r.side.traffic.insert(other_host, tr(18, 2, false));
+        r.step(&[(id, state(false, relay(4379)))], "F,P,A,L");
+        let v = &r.peers[&id];
+        assert_eq!(v.evidence.letters(), "PL");
+        assert_eq!(v.relay_eps, vec![other_host]);
+        assert_eq!(v.relay_ip, Some(*relay(0).ip())); // the RTT-carrying host
+        assert!(v.is_relay_endpoint(&relay(4379)) && v.is_relay_endpoint(&other_host));
+        // P alone (no lists) finds it too.
+        let mut r = Rig::new("twohost-p");
+        r.traffic.insert(relay(4379), tr(2, 33, true));
+        r.side.traffic.insert(other_host, tr(18, 2, false));
+        r.step(&[(id, state(false, relay(4379)))], "P");
+        assert_eq!(r.peers[&id].relay_eps, vec![other_host]);
+    }
+
+    /// A direct peer next to a relayed one: the direct peer's endpoint is
+    /// never taken, and only the relayed peer gets relay endpoints.
+    #[test]
+    fn direct_peer_next_to_a_relayed_one() {
+        let mut r = Rig::new("mixed");
+        let lan = SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 15), 58864);
+        r.traffic.insert(lan, tr(19, 37, true));
+        r.traffic.insert(relay(4379), tr(2, 33, true));
+        r.side.traffic.insert(relay(4380), tr(18, 2, false));
+        r.step(
+            &[
+                (SteamId(1), state(false, lan)),
+                (SteamId(2), state(false, relay(4379))),
+            ],
+            "F,P,A,L",
+        );
+        assert!(r.peers[&SteamId(1)].relay_eps.is_empty());
+        assert_eq!(r.peers[&SteamId(2)].relay_eps, vec![relay(4380)]);
+        assert_eq!(r.by_endpoint.get(&lan), Some(&SteamId(1)));
     }
 
     #[test]
