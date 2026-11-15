@@ -75,6 +75,8 @@ Valve's relays are application-level forwarding nodes chosen by Steam, not by In
 
 **Takeaway.** Comparing direct and relayed paths for the same pair of players (experiment E4) directly measures the cost or benefit of an overlay.
 
+**Result (E3): a third path, a direct TCP fallback.** When every UDP path between the two players was impaired, Steam's older P2P interface moved the session to a direct TCP connection between the two Steam clients. It carries the same datagrams, each with a 2-byte length prefix, and is not relayed. `GetP2PSessionState` still reported a direct session, so a tool that only watches UDP loses it. On this path, delay makes the other player's updates arrive in bursts, and movement looks choppy at a ping that would be smooth on UDP ([E3](../experiments/e3.md)).
+
 ### 2.4 What a third-party tool can and cannot observe
 
 | Observable without touching the game | Not observable |
