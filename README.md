@@ -70,14 +70,14 @@ The program is `target\release\ds3sm.exe`. The build places the required `steam_
    ```powershell
    .\target\release\ds3sm.exe monitor
    ```
-   Add your approximate location to see distances and the fastest-possible ping, for example `--home-lat 51.5 --home-lon -0.1`.
+   Add your approximate location to see distances and the fastest-possible ping, for example `--home-lat 51.5 --home-lon -0.1`. Add `--tcp` (experimental) to keep measuring when Steam switches a bad connection to its TCP fallback.
 
 ### Reading the table
 
 | Column | Meaning |
 |---|---|
-| `st` | `A` = connected, `C` = connecting. `A!` = Steam says connected, but no game data has reached your PC over UDP for several seconds: Steam has probably moved the connection somewhere the tool can't see (e.g. through its own servers), so the ping, jitter and loss numbers are out of date. This happens when the connection is very bad. |
-| `relay` | `no` = direct. `yes*` = going through a Valve relay server, and ds3sm found the relay's connections. `yes` = Steam says it's relayed, but the relay wasn't found. |
+| `st` | `A` = connected, `C` = connecting. `A!` = Steam says connected, but no game data has reached your PC over UDP for several seconds: Steam has probably switched to its TCP fallback (see `relay`), so the ping, jitter and loss numbers are out of date. Start the monitor with `--tcp` to keep measuring. This happens when the connection is very bad. |
+| `relay` | `no` = direct. `yes*` = going through a Valve relay server, and ds3sm found the relay's connections. `yes` = Steam says it's relayed, but the relay wasn't found. `tcp` = Steam has moved the connection to its **TCP fallback**, a direct TCP link to the player that it uses when normal (UDP) traffic keeps failing. Only shown with `--tcp` (experimental). The ping and jitter then include TCP's own resend delay, and `nrep%` shows the share of your packets TCP had to send again (marked `r`). |
 | `via` | Which signs of a relay were seen: `F` Steam's own flag, `P` the traffic pattern, `A` the network owner (needs the ASN database), `L` ds3sm's built-in list of Valve relay addresses. `-` = none. |
 | `remote` | The address the ping is measured to: the player, or the relay server |
 | `last` / `med` / `p95` | Latest, typical and worst-case ping in milliseconds. Through a relay, this is the full round trip to the player and back, not just to the relay. |

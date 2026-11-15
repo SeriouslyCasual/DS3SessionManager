@@ -50,6 +50,8 @@ mod monitor; // the `probe` and `monitor` commands (main loop)
 #[cfg(windows)]
 mod steam; // talks to the local Steam client
 #[cfg(windows)]
+mod tcp; // Steam's TCP fallback telemetry, separate from the UDP method
+#[cfg(windows)]
 mod win; // find the game process, check admin rights
 
 // `use` brings names into scope so the code can write `Result` instead of
@@ -119,6 +121,11 @@ pub struct MonitorArgs {
     // A `bool` flag is `false` unless the user passes `--no-etw`.
     #[arg(long)]
     pub no_etw: bool,
+    /// Also follow Steam's TCP fallback (experimental): when Steam moves a
+    /// session off UDP to a direct TCP connection, keep reporting RTT,
+    /// jitter and resends from it, marked `tcp`. Off by default.
+    #[arg(long)]
+    pub tcp: bool,
     /// Free-text label stored with the run (e.g. what you were testing).
     #[arg(long, default_value = "")]
     pub label: String,

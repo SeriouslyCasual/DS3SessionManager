@@ -36,6 +36,7 @@ use crate::stats::Rolling;
 use crate::steam::Steam;
 use crate::store::{GeoRow, GeoSubject, Store, StreamStats, TrafficRow};
 use crate::stun::{Direction, StunConfig, StunMatcher};
+use crate::tcp::TcpPaths;
 use crate::valve::{self, VALVE_ASN};
 use crate::valve_data::Pop;
 use crate::win;
@@ -227,12 +228,12 @@ const RATE_LAG_NS: i128 = 1_500_000_000;
 /// batches, every other redraw shows double the true rate and the next shows
 /// 0, and a delayed batch shows as a huge spike.
 #[derive(Default, Clone)]
-struct RateWindow {
+pub(crate) struct RateWindow {
     ts: std::collections::VecDeque<i128>,
 }
 
 impl RateWindow {
-    fn push(&mut self, t_ns: i128) {
+    pub(crate) fn push(&mut self, t_ns: i128) {
         self.ts.push_back(t_ns);
         // Drop timestamps too old to ever fall inside a window again.
         let keep = RATE_WINDOW_NS + RATE_LAG_NS + 1_000_000_000;
@@ -242,7 +243,7 @@ impl RateWindow {
     }
 
     /// Packets per second over `[now - lag - window, now - lag]`.
-    fn rate(&self, now_ns: i128) -> f64 {
+    pub(crate) fn rate(&self, now_ns: i128) -> f64 {
         let end = now_ns - RATE_LAG_NS;
         let start = end - RATE_WINDOW_NS;
         let n = self.ts.iter().filter(|&&t| t > start && t <= end).count();
@@ -365,6 +366,10 @@ struct PeerView {
     unseen_since: Option<i128>,
     /// Whether `path_unseen` is the last logged path event.
     unseen_logged: bool,
+    /// Whether the peer is currently measured from Steam's TCP fallback
+    /// (`--tcp`), and the RTT samples from it, kept apart from `rtt`.
+    on_tcp: bool,
+    tcp_rtt: Rolling,
 }
 
 /// How long an active session must stay silent on UDP, beyond the 5 s rate
@@ -380,6 +385,13 @@ const UNSEEN_HOLD_NS: i128 = 3_000_000_000;
 /// "silent since" time.
 fn unseen_step(since: Option<i128>, active: bool, pps_in: f64, t: i128) -> Option<i128> {
     (active && pps_in == 0.0).then(|| since.unwrap_or(t))
+}
+
+/// Whether a peer is measured from Steam's TCP fallback: no UDP at all from
+/// any of its endpoints, and TCP data arriving on Steam's reported one. Any
+/// UDP from the player keeps the row on UDP, the main method.
+fn on_tcp_fallback(udp_pps_in: f64, tcp_receiving: bool) -> bool {
+    udp_pps_in == 0.0 && tcp_receiving
 }
 
 /// Whether a peer silent since `since` counts as unseen at `t`.
@@ -422,6 +434,8 @@ impl PeerView {
             relay_geo: None,
             unseen_since: None,
             unseen_logged: false,
+            on_tcp: false,
+            tcp_rtt: Rolling::new(window),
         }
     }
 
@@ -556,7 +570,7 @@ pub fn run(args: MonitorArgs) -> Result<()> {
     let (trace, byte_order) = if args.no_etw {
         (None, None)
     } else {
-        let t = etw::start()?;
+        let t = etw::start_with(args.tcp)?;
         let (bo, _) = etw::calibrate(&t)?;
         store.event(now_ns(), "etw_byte_order", &format!("{bo:?}"))?;
         t.game_pid.store(game_pid, Ordering::Relaxed);
@@ -587,6 +601,13 @@ pub fn run(args: MonitorArgs) -> Result<()> {
     let mut next_poll = Instant::now();
     let mut last_pid_check = Instant::now();
     let mut last_traffic_log = Instant::now();
+    // TCP fallback state, only with `--tcp` and ETW on. Separate from every
+    // UDP structure above (`tcp.rs`).
+    let mut tcp_paths =
+        (args.tcp && trace.is_some()).then(|| TcpPaths::new(args.req_size, args.reply_size));
+    if tcp_paths.is_some() {
+        store.set_meta("tcp_fallback", "on")?;
+    }
 
     // Main loop. ETW events are drained every ~10 ms, but Steam is polled and
     // the table redrawn only every `interval` (default 500 ms). Packet
@@ -609,6 +630,10 @@ pub fn run(args: MonitorArgs) -> Result<()> {
                 &mut peers,
                 &store,
             )?;
+        }
+        // 1b. Drain TCP fallback events (`--tcp`).
+        if let (Some(t), Some(bo), Some(tp)) = (&trace, byte_order, tcp_paths.as_mut()) {
+            drain_tcp(t, bo, steam_pid, tp, &by_endpoint, &mut peers, &store)?;
         }
 
         if Instant::now() < next_poll {
@@ -692,6 +717,7 @@ pub fn run(args: MonitorArgs) -> Result<()> {
             if !current.contains(id) {
                 view.unseen_since = None;
                 view.unseen_logged = false;
+                view.on_tcp = false;
             }
         }
 
@@ -741,9 +767,25 @@ pub fn run(args: MonitorArgs) -> Result<()> {
             // Relayed by Steam's flag with no relay endpoint found yet is its
             // own case ("yes" in the table), not an unseen path.
             let relay_unfound = view.evidence.relayed(&ctx.detectors) && view.relay_eps.is_empty();
+            // TCP fallback (`--tcp` only): no UDP from the player, but TCP
+            // data arriving on Steam's reported endpoint. Then the row is
+            // measured from TCP, so it isn't an unseen path.
+            let on_tcp = tcp_paths.as_ref().is_some_and(|tp| {
+                on_tcp_fallback(pps_in, st.remote.is_some_and(|r| tp.receiving(&r, t)))
+            });
+            if on_tcp != view.on_tcp {
+                let remote = st.remote.map_or("-".into(), |r| r.to_string());
+                let kind = if on_tcp {
+                    "tcp_fallback"
+                } else {
+                    "tcp_fallback_end"
+                };
+                store.event(t, kind, &format!("{id} {remote}"))?;
+                view.on_tcp = on_tcp;
+            }
             view.unseen_since = unseen_step(
                 view.unseen_since,
-                st.active && !st.connecting && !relay_unfound,
+                st.active && !st.connecting && !relay_unfound && !on_tcp,
                 pps_in,
                 t,
             );
@@ -760,6 +802,9 @@ pub fn run(args: MonitorArgs) -> Result<()> {
         if last_traffic_log.elapsed() >= Duration::from_secs(5) {
             last_traffic_log = Instant::now();
             log_traffic(&traffic, &side, &by_endpoint, &peers, &matcher, &store, t)?;
+            if let Some(tp) = &tcp_paths {
+                log_tcp_traffic(tp, &by_endpoint, &store, t)?;
+            }
         }
 
         if !args.quiet {
@@ -772,8 +817,12 @@ pub fn run(args: MonitorArgs) -> Result<()> {
                 &matcher,
                 &ctx,
                 trace.is_some(),
+                tcp_paths.as_ref(),
             );
         }
+    }
+    if let Some(d) = trace.as_ref().and_then(|t| t.tcp_diag.as_ref()) {
+        store.event(now_ns(), "etw_tcp_diag", &d.summary())?;
     }
     store.event(now_ns(), "stop", "")?;
     println!("run saved to {}", db_path.display());
@@ -1201,6 +1250,83 @@ fn drain_etw(
     Ok(())
 }
 
+/// Move TCP events from the ETW thread into the TCP fallback state
+/// (`--tcp`). Only steam.exe segments to an endpoint Steam reports for a
+/// peer count; Steam's own server connection and everything else is
+/// ignored. RTT samples are stored as `etw_tcp` and kept in the peer's
+/// `tcp_rtt`, never in the UDP statistics.
+fn drain_tcp(
+    t: &etw::UdpTrace,
+    bo: ByteOrder,
+    steam_pid: u32,
+    tcp: &mut TcpPaths,
+    by_endpoint: &HashMap<SocketAddrV4, SteamId>,
+    peers: &mut HashMap<SteamId, PeerView>,
+    store: &Store,
+) -> Result<()> {
+    let Some(rx) = &t.tcp_rx else {
+        return Ok(());
+    };
+    while let Ok(raw) = rx.try_recv() {
+        let s = bo.decode_tcp(&raw);
+        let Some(id) = (s.pid == steam_pid)
+            .then(|| by_endpoint.get(&s.remote).copied())
+            .flatten()
+        else {
+            continue;
+        };
+        let kind = match s.kind {
+            etw::TcpKind::Send => "send",
+            etw::TcpKind::Recv => "recv",
+            etw::TcpKind::Retransmit => "retx",
+        };
+        store.insert_tcp_seg(s.t_ns, s.remote, kind, s.size)?;
+        if let Some(m) = tcp.observe(&s) {
+            let sample = RttSample {
+                t_ns: m.t_ns,
+                rtt_ms: m.rtt_ms,
+                source: RttSource::EtwTcp,
+            };
+            store.insert_rtt(Some(id), m.remote, &sample)?;
+            if let Some(view) = peers.get_mut(&id) {
+                view.tcp_rtt.push(m.rtt_ms);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// One `traffic` row per TCP fallback path, role `peer_tcp`, with the TCP
+/// matcher's counters in the STUN columns. Written next to the UDP rows,
+/// which are unchanged.
+fn log_tcp_traffic(
+    tcp: &TcpPaths,
+    by_endpoint: &HashMap<SocketAddrV4, SteamId>,
+    store: &Store,
+    t: i128,
+) -> Result<()> {
+    for (ep, p) in tcp.paths() {
+        store.insert_traffic(&TrafficRow {
+            t_ns: t,
+            steam_id: by_endpoint.get(ep).copied(),
+            remote: *ep,
+            role: "peer_tcp",
+            pps_in: p.rate_in.rate(t),
+            pps_out: p.rate_out.rate(t),
+            pkts_in: p.pkts_in,
+            pkts_out: p.pkts_out,
+            bytes_in: p.bytes_in,
+            bytes_out: p.bytes_out,
+            payload: None,
+            max_gap_in_ms: p.max_gap_in_ns as f64 / 1e6,
+            jit_in: stream_stats(&p.jit_in, t),
+            jit_out: stream_stats(&p.jit_out, t),
+            stun: tcp.counters(ep),
+        })?;
+    }
+    Ok(())
+}
+
 /// Look up a peer's location once and store it, computing the distance and
 /// speed-of-light bound if the user gave their own coordinates. Private and
 /// LAN addresses are skipped (GeoIP can't place them).
@@ -1277,6 +1403,7 @@ fn draw(
     matcher: &StunMatcher,
     ctx: &RelayCtx<'_>,
     etw_on: bool,
+    tcp: Option<&TcpPaths>,
 ) {
     let det = &ctx.detectors;
     let t_now = now_ns();
@@ -1297,7 +1424,19 @@ fn draw(
     ));
     for id in current {
         let Some(v) = peers.get(id) else { continue };
-        let s = v.rtt.summary();
+        // On Steam's TCP fallback (`--tcp`), the row is measured from TCP:
+        // RTT from the framed checks, jitter from the framed stream, and the
+        // loss column shows outbound resends. Otherwise UDP, as always.
+        let tcp_path = if v.on_tcp {
+            tcp.zip(v.state.remote).and_then(|(tp, r)| tp.path(&r))
+        } else {
+            None
+        };
+        let s = if tcp_path.is_some() {
+            v.tcp_rtt.summary()
+        } else {
+            v.rtt.summary()
+        };
         let st = if v.state.active && path_unseen(v.unseen_since, t_now) {
             "A!"
         } else if v.state.active {
@@ -1342,6 +1481,17 @@ fn draw(
             (Some(i), Some(o))
         };
         let jit = peer_jitter(&eps, traffic, side, t_now);
+        let (relay_col, loss_col, pin, pout, jit) = match tcp_path {
+            Some(p) => (
+                "tcp",
+                p.retransmit_share(t_now)
+                    .map_or("-".into(), |x| format!("{:.0}r", 100.0 * x)),
+                Some(p.rate_in.rate(t_now)),
+                Some(p.rate_out.rate(t_now)),
+                stream_stats(&p.jit_in, t_now).map(|j| j.jitter_ms),
+            ),
+            None => (relay_col, opt(noreply, 0), pin, pout, jit),
+        };
         // Geo: the player's if known; otherwise the relay's, marked "R:".
         let (cc, km, bound) = match (&v.geo, &v.relay_geo) {
             (Some(g), _) => (
@@ -1384,7 +1534,7 @@ fn draw(
             opt(s.map(|s| s.stddev), 1),
             opt(s.map(|s| s.ipdv), 1),
             opt(jit, 1),
-            opt(noreply, 0),
+            loss_col,
             opt(pin, 0),
             opt(pout, 0),
             cc,
@@ -1408,9 +1558,15 @@ fn draw(
         let secs = v.unseen_since.map_or(0, |s| (t_now - s) / 1_000_000_000);
         out.push_str(&format!(
             "A! {name}: Steam says the session is active, but no UDP has arrived from them for {secs} s. \
-             The traffic has probably moved off UDP (e.g. through Steam's servers), which ds3sm can't see; \
+             The traffic has probably moved to Steam's TCP fallback (start with --tcp to follow it); \
              RTT, jit and nrep% are stale.\n"
         ));
+    }
+    if shown.iter().any(|(_, v)| v.on_tcp) {
+        out.push_str(
+            "tcp = Steam moved this connection to its TCP fallback (direct, not a relay): RTT/jit come from \
+             TCP and include its resend delay; nrep% shows outbound resends (r)\n",
+        );
     }
     let any_relayed = shown.iter().any(|(_, v)| v.evidence.relayed(det));
     if any_relayed {
@@ -1639,6 +1795,16 @@ mod tests {
         assert_eq!(unseen_step(since, true, 0.2, 14 * s), None);
         assert_eq!(unseen_step(since, false, 0.0, 14 * s), None);
         assert!(!path_unseen(None, 99 * s));
+    }
+
+    /// TCP takes over only when UDP is silent and TCP is receiving; any UDP
+    /// keeps the row on the main method.
+    #[test]
+    fn tcp_fallback_only_without_udp() {
+        assert!(on_tcp_fallback(0.0, true));
+        assert!(!on_tcp_fallback(0.2, true));
+        assert!(!on_tcp_fallback(17.0, true));
+        assert!(!on_tcp_fallback(0.0, false));
     }
 
     /// E3 Block C: an endpoint abandoned after a relay switch kept logging

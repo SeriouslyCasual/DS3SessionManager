@@ -25,6 +25,7 @@
 //! | `geo`       | peer's estimated location                      |
 //! | `event`     | notable happening (game restarted, peer left)  |
 //! | `traffic`   | endpoint every 5 s (rates, gaps, jitter)       |
+//! | `tcp_seg`   | steam.exe TCP segment to a peer (`--tcp` only) |
 
 use crate::anon;
 use crate::model::{P2PState, RttSample, SteamId};
@@ -67,6 +68,13 @@ CREATE TABLE IF NOT EXISTS rtt (
     remote_port INTEGER NOT NULL,
     rtt_ms REAL NOT NULL,
     source TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS tcp_seg (
+    t_ns INTEGER NOT NULL,
+    remote_ip TEXT NOT NULL,
+    remote_port INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    size INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS geo (
     steam_id INTEGER NOT NULL,
@@ -278,6 +286,29 @@ impl Store {
 
     /// Append one RTT sample. `id` is `Option` because ETW can time a packet to an
     /// endpoint that Steam hasn't (yet) reported as belonging to a peer.
+    /// Log one steam.exe TCP segment to a peer endpoint (`monitor --tcp`
+    /// only): kind is "send", "recv" or "retx". Lets a capture check the
+    /// kernel's event granularity and the framed sizes segment by segment.
+    pub fn insert_tcp_seg(
+        &self,
+        t_ns: i128,
+        remote: std::net::SocketAddrV4,
+        kind: &str,
+        size: u32,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO tcp_seg VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                t_ns as i64,
+                remote.ip().to_string(),
+                remote.port(),
+                kind,
+                size
+            ],
+        )?;
+        Ok(())
+    }
+
     pub fn insert_rtt(
         &self,
         id: Option<SteamId>,

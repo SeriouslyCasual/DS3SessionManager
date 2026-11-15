@@ -81,6 +81,62 @@ static UDP_IP_PROVIDER: KernelProvider = KernelProvider::new(
     0x0001_0000, // EVENT_TRACE_FLAG_NETWORK_TCPIP
 );
 
+/// The kernel's TCP event class (`TcpIp`), enabled by the **same** flag as
+/// `UdpIp`, so the kernel already produces these events for the UDP trace;
+/// they are only *read* when a callback is registered under this GUID, which
+/// [`start_with`] does only when asked (`monitor --tcp`). Used to follow
+/// Steam's TCP fallback (E3 C2): with every UDP path impaired, Steam carries
+/// the same P2P datagrams over a direct TCP connection to the peer, each with
+/// a 2-byte length prefix (see `tcp.rs`).
+static TCP_IP_PROVIDER: KernelProvider = KernelProvider::new(
+    GUID::from_values(
+        0x9a280ac0,
+        0xc8e0,
+        0x11d1,
+        [0x84, 0xe2, 0x00, 0xc0, 0x4f, 0xb9, 0x98, 0xa2],
+    ),
+    0x0001_0000, // EVENT_TRACE_FLAG_NETWORK_TCPIP
+);
+
+/// `TcpIp` opcodes for IPv4: send (`TcpIp_SendIPV4`), receive and
+/// retransmit (`TcpIp_TypeGroup1`). All carry PID, size, daddr, saddr,
+/// dport and sport, like the UDP events.
+const OP_TCP_SEND_V4: u8 = 10;
+const OP_TCP_RECV_V4: u8 = 11;
+const OP_TCP_RETRANSMIT_V4: u8 = 14;
+
+/// What a TCP event reports.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TcpKind {
+    Send,
+    Recv,
+    /// A segment this PC sent again (a loss signal, outbound only).
+    Retransmit,
+}
+
+/// One raw TCP event, before byte-order decoding. Same fields as [`RawUdp`].
+#[derive(Clone, Copy, Debug)]
+pub struct RawTcp {
+    pub t_ns: i128,
+    pub pid: u32,
+    pub kind: TcpKind,
+    pub daddr: u32,
+    pub saddr: u32,
+    pub dport: u16,
+    pub sport: u16,
+    pub size: u32,
+}
+
+/// A decoded TCP event: the remote side, as for UDP.
+#[derive(Clone, Copy, Debug)]
+pub struct TcpSegment {
+    pub t_ns: i128,
+    pub pid: u32,
+    pub kind: TcpKind,
+    pub remote: SocketAddrV4,
+    pub size: u32,
+}
+
 /// FILETIME of the Unix epoch, in 100 ns units.
 // FILETIME counts 100-ns ticks from 1601-01-01. This constant is how many
 // ticks separate 1601-01-01 from 1970-01-01 (the Unix epoch), so
@@ -145,6 +201,24 @@ impl ByteOrder {
             size: r.size,
         }
     }
+
+    /// Decode a TCP event with the byte order learned from the UDP probe
+    /// (same kernel provider, same field encoding).
+    pub fn decode_tcp(self, r: &RawTcp) -> TcpSegment {
+        let remote = match r.kind {
+            TcpKind::Send | TcpKind::Retransmit => {
+                SocketAddrV4::new(self.addr(r.daddr), self.port(r.dport))
+            }
+            TcpKind::Recv => SocketAddrV4::new(self.addr(r.saddr), self.port(r.sport)),
+        };
+        TcpSegment {
+            t_ns: r.t_ns,
+            pid: r.pid,
+            kind: r.kind,
+            remote,
+            size: r.size,
+        }
+    }
 }
 
 /// A running kernel trace. Stops when dropped.
@@ -163,6 +237,11 @@ pub struct UdpTrace {
     pub rx: Receiver<RawUdp>,
     /// Counters for every place an event can be dropped (see [`Diag`]).
     pub diag: Arc<Diag>,
+    /// TCP events from steam.exe, only when started with TCP enabled.
+    pub tcp_rx: Option<Receiver<RawTcp>>,
+    /// The TCP callback's own counters (its `udp_v4` field counts IPv4 TCP
+    /// send/receive/retransmit events).
+    pub tcp_diag: Option<Arc<Diag>>,
 }
 
 /// Diagnostic counters, filled on ferrisetw's thread.
@@ -297,6 +376,67 @@ fn parse_event(
     })
 }
 
+/// Turn one `TcpIp` event into a `RawTcp`, or `None` if it isn't an IPv4
+/// send/receive/retransmit by steam.exe. Runs on ferrisetw's thread for every
+/// TCP event on the PC, so, like [`parse_event`], it checks the opcode first
+/// and drops other processes as soon as the PID is read.
+fn parse_tcp_event(
+    record: &EventRecord,
+    locator: &SchemaLocator,
+    steam_pid: u32,
+    diag: &Diag,
+) -> Option<RawTcp> {
+    let op = record.opcode();
+    diag.total.fetch_add(1, Ordering::Relaxed);
+    diag.opcodes[(op / 64) as usize].fetch_or(1u64 << (op % 64), Ordering::Relaxed);
+    let kind = match op {
+        OP_TCP_SEND_V4 => TcpKind::Send,
+        OP_TCP_RECV_V4 => TcpKind::Recv,
+        OP_TCP_RETRANSMIT_V4 => TcpKind::Retransmit,
+        _ => return None,
+    };
+    if steam_pid == u32::MAX {
+        return None;
+    }
+    diag.udp_v4.fetch_add(1, Ordering::Relaxed);
+    let schema = match locator.event_schema(record) {
+        Ok(s) => s,
+        Err(e) => {
+            diag.schema_err.fetch_add(1, Ordering::Relaxed);
+            diag.note_err(format!("tcp schema: {e:?}"));
+            return None;
+        }
+    };
+    let p = Parser::create(record, &schema);
+    macro_rules! field {
+        ($name:literal) => {
+            match p.try_parse($name) {
+                Ok(v) => v,
+                Err(e) => {
+                    diag.field_err.fetch_add(1, Ordering::Relaxed);
+                    diag.note_err(format!("tcp field {}: {e:?}", $name));
+                    return None;
+                }
+            }
+        };
+    }
+    let pid: u32 = field!("PID");
+    if pid != steam_pid {
+        return None;
+    }
+    let ft = record.raw_timestamp();
+    Some(RawTcp {
+        t_ns: (ft - FILETIME_UNIX_EPOCH) as i128 * 100,
+        pid,
+        kind,
+        daddr: field!("daddr"),
+        saddr: field!("saddr"),
+        dport: field!("dport"),
+        sport: field!("sport"),
+        size: field!("size"),
+    })
+}
+
 /// Start the kernel UDP trace. Requires administrator rights.
 // How the pieces connect:
 //
@@ -320,6 +460,13 @@ fn parse_event(
 // - `.map_err(...)` converts ferrisetw's error type into anyhow's, and
 //   `.context(...)` adds the likely fix to the message.
 pub fn start() -> Result<UdpTrace> {
+    start_with(false)
+}
+
+/// Start the kernel trace; with `tcp`, also read steam.exe's TCP events (a
+/// second provider on the same session, its own callback, channel and
+/// counters). Without it, the trace is exactly the UDP-only one.
+pub fn start_with(tcp: bool) -> Result<UdpTrace> {
     let (tx, rx): (Sender<RawUdp>, Receiver<RawUdp>) = channel();
     let game_pid = Arc::new(AtomicU32::new(u32::MAX));
     let steam_pid = Arc::new(AtomicU32::new(u32::MAX));
@@ -343,9 +490,28 @@ pub fn start() -> Result<UdpTrace> {
     let provider = Provider::kernel(&UDP_IP_PROVIDER)
         .add_callback(callback)
         .build();
-    let trace = KernelTrace::new()
+    let mut builder = KernelTrace::new()
         .named(format!("ds3sm-udp-{self_pid}"))
-        .enable(provider)
+        .enable(provider);
+    let (mut tcp_rx, mut tcp_diag) = (None, None);
+    if tcp {
+        let (ttx, trx): (Sender<RawTcp>, Receiver<RawTcp>) = channel();
+        let td = Arc::new(Diag::default());
+        let (sp2, td2) = (Arc::clone(&steam_pid), Arc::clone(&td));
+        let tcp_cb = move |record: &EventRecord, locator: &SchemaLocator| {
+            if let Some(ev) = parse_tcp_event(record, locator, sp2.load(Ordering::Relaxed), &td2) {
+                let _ = ttx.send(ev);
+            }
+        };
+        builder = builder.enable(
+            Provider::kernel(&TCP_IP_PROVIDER)
+                .add_callback(tcp_cb)
+                .build(),
+        );
+        tcp_rx = Some(trx);
+        tcp_diag = Some(td);
+    }
+    let trace = builder
         .start_and_process()
         .map_err(|e| anyhow!("{e:?}"))
         .context("starting kernel ETW trace (run as administrator)")?;
@@ -355,6 +521,8 @@ pub fn start() -> Result<UdpTrace> {
         steam_pid,
         rx,
         diag,
+        tcp_rx,
+        tcp_diag,
     })
 }
 
@@ -442,6 +610,45 @@ mod tests {
             UDP_IP_PROVIDER.guid,
             GUID::from("bf3a50c5-a9c9-4988-a005-2df0b7c80f80")
         );
+    }
+
+    #[test]
+    fn tcp_provider_is_tcpip_class_on_the_same_flag() {
+        assert_eq!(
+            TCP_IP_PROVIDER.guid,
+            GUID::from("9a280ac0-c8e0-11d1-84e2-00c04fb998a2")
+        );
+        assert_eq!(TCP_IP_PROVIDER.flags, UDP_IP_PROVIDER.flags);
+    }
+
+    #[test]
+    fn tcp_decode_uses_remote_side_for_each_kind() {
+        let bo = ByteOrder {
+            swap_addr: true,
+            swap_port: true,
+        };
+        let peer = u32::from(Ipv4Addr::new(192, 0, 2, 15)).swap_bytes();
+        let me = u32::from(Ipv4Addr::new(192, 0, 2, 9)).swap_bytes();
+        let want = SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 15), 49202);
+        for (kind, daddr, saddr, dport, sport) in [
+            (TcpKind::Send, peer, me, 49202u16, 53795u16),
+            (TcpKind::Retransmit, peer, me, 49202, 53795),
+            (TcpKind::Recv, me, peer, 53795, 49202),
+        ] {
+            let r = RawTcp {
+                t_ns: 1,
+                pid: 7,
+                kind,
+                daddr,
+                saddr,
+                dport: dport.swap_bytes(),
+                sport: sport.swap_bytes(),
+                size: 87,
+            };
+            let s = bo.decode_tcp(&r);
+            assert_eq!(s.remote, want, "{kind:?}");
+            assert_eq!((s.kind, s.size, s.pid), (kind, 87, 7));
+        }
     }
 
     #[test]
