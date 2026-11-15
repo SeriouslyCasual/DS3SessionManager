@@ -432,6 +432,15 @@ class StreamJitterMirror(unittest.TestCase):
         old, _ = ev.jitter_track(p, per_slot=False)
         self.assertGreater(old.value(), 20.0)  # the pre-E3 rule's failure
 
+    def test_stream_starting_under_heavy_loss_learns_the_period(self):
+        # 2 slots in 5 from the first packet (gaps T, 4T, ...): raw median 2.5T.
+        p = [(i * self.T, 85) for i in range(400) if i % 5 < 2]
+        j, _ = ev.jitter_track(p)
+        self.assertAlmostEqual(j.period_ms(), 83.333, places=2)
+        self.assertLess(j.value(), 1e-6)
+        old, _ = ev.jitter_track(p, per_slot=False)
+        self.assertGreater(old.period_ms(), 150.0)
+
     def test_compare_matches_delayed_rows_and_skips_settling(self):
         # Capture J after each packet (every 100 ms); each row holds the value
         # from 700 ms before it (ETW delivered late) and is written on the second.

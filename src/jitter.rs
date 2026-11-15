@@ -15,8 +15,12 @@
 //! ```
 //!
 //! - `T` is the median of the last 64 per-slot inter-arrival times (the
-//!   sender's period, learned from the stream itself). Until `T` is known the
-//!   raw gaps are used. After that each gap goes in as `gap / k`, so a gap
+//!   sender's period, learned from the stream itself). It starts from the
+//!   first 16 raw gaps: their 10th percentile is the seed period (a gap of
+//!   one slot, even when most gaps span several because of loss; E3 C2
+//!   showed new endpoints starting under 50 % loss learning 2–3T from a
+//!   median), and those 16 gaps are rewritten per slot against it. After
+//!   that each gap goes in as `gap / k`, so a gap
 //!   that spans k slots counts as k slots, not as one long period. Without
 //!   this, heavy loss drags `T` up: at about 50 % loss most gaps are 2T or
 //!   longer, the median doubles, and jitter reads about T/2 on a clean
@@ -27,15 +31,16 @@
 //!   between two slots gets k = 0, so it counts as its offset, not as a gap.
 //! - The period follows changes of less than half a slot (e.g. 12 → 10 Hz);
 //!   a sender that halves its rate looks like 50 % loss and keeps the old
-//!   `T`, which still gives the right jitter. A stream that *starts* under
-//!   heavy loss can learn a multiple of the true period.
+//!   `T`, which still gives the right jitter. A stream that starts under
+//!   loss so heavy that fewer than about 1 gap in 10 is a single slot (over
+//!   ~85 % loss) can still learn a multiple of the true period.
 //! - Delays above T/2 (about 42 ms at 12 Hz) can't be told apart from a
 //!   missing or extra packet; the largest inbound gap shows those.
 //!
 //! Which stream: per endpoint and direction, the packet size seen most often
 //! (the "dominant" size). If another size overtakes it, the estimate starts
-//! over. The first ~8 packets only learn `T`, and `J` starts at 0 (as in
-//! RFC 3550), so it reads low for the first second or two.
+//! over. The first ~16 packets only learn `T`, and `J` starts at 0 (as in
+//! RFC 3550), so it reads low for the first two or three seconds.
 //!
 //! # The Rust idea
 //!
@@ -49,7 +54,11 @@ const GAIN: f64 = 16.0;
 /// Inter-arrival times kept for the period estimate.
 const PERIOD_WINDOW: usize = 64;
 /// Inter-arrival times needed before the period (and so jitter) is trusted.
-const MIN_PERIOD_SAMPLES: usize = 8;
+const MIN_PERIOD_SAMPLES: usize = 16;
+/// Percentile of the first gaps taken as the seed period: low enough to land
+/// on a single-slot gap under heavy loss, high enough to skip a stray extra
+/// packet or two.
+const SEED_PERCENTILE: f64 = 10.0;
 
 /// Jitter of one endpoint's packets in one direction.
 #[derive(Default, Clone, Debug)]
@@ -62,6 +71,8 @@ pub struct StreamJitter {
     last_ns: Option<i128>,
     /// Recent per-slot inter-arrival times (gap / k once `T` is known), ms.
     iats: VecDeque<f64>,
+    /// The first gaps have been rewritten against the seed period.
+    seeded: bool,
     jitter_ms: f64,
     /// Number of D values fed into `jitter_ms`.
     samples: u64,
@@ -84,6 +95,7 @@ impl StreamJitter {
                 self.size = Some(size);
                 self.last_ns = None;
                 self.iats.clear();
+                self.seeded = false;
                 self.jitter_ms = 0.0;
                 self.samples = 0;
             }
@@ -114,12 +126,34 @@ impl StreamJitter {
                 self.iats.pop_front();
             }
             self.iats.push_back(s);
+            if self.iats.len() == MIN_PERIOD_SAMPLES && self.period_ms().is_none() {
+                self.seed_period();
+            }
         }
+    }
+
+    /// Rewrite the first raw gaps per slot against a low-percentile seed, so
+    /// the median that follows is the period even if the stream started
+    /// under heavy loss. Gaps shorter than half the seed (extra packets) are
+    /// dropped; if that leaves too few, more raw gaps are collected first.
+    fn seed_period(&mut self) {
+        let mut v: Vec<f64> = self.iats.iter().copied().collect();
+        v.sort_by(|a, b| a.total_cmp(b));
+        let seed = crate::stats::percentile(&v, SEED_PERCENTILE);
+        self.iats = self
+            .iats
+            .iter()
+            .filter_map(|&g| {
+                let k = (g / seed).round();
+                (k >= 1.0).then(|| g / k)
+            })
+            .collect();
+        self.seeded = self.iats.len() >= MIN_PERIOD_SAMPLES;
     }
 
     /// The sender's period `T` (median per-slot gap), once enough are known.
     pub fn period_ms(&self) -> Option<f64> {
-        if self.iats.len() < MIN_PERIOD_SAMPLES {
+        if !self.seeded {
             return None;
         }
         let mut v: Vec<f64> = self.iats.iter().copied().collect();
@@ -285,6 +319,60 @@ mod tests {
         }
         let v = j.jitter_ms().unwrap();
         assert!(v < 2.5, "{v}");
+    }
+
+    /// E3 C2: a new endpoint whose stream starts under heavy loss. Keeping 2
+    /// slots in 5 (gaps T, 4T, T, 4T, ...) has a raw median of 2.5T; the
+    /// low-percentile seed finds T.
+    #[test]
+    fn a_stream_starting_under_heavy_loss_learns_the_period() {
+        let mut j = StreamJitter::default();
+        for i in 0..400 {
+            if i % 5 < 2 {
+                j.observe(85, i * T);
+            }
+        }
+        assert!((j.period_ms().unwrap() - 83.333).abs() < 0.01);
+        assert!(j.jitter_ms().unwrap() < 1e-6, "{:?}", j.jitter_ms());
+    }
+
+    /// Random 60 % loss from the first packet (xorshift, 20 fixed seeds):
+    /// every run learns T exactly, and jitter stays below the 0.1 ms sender
+    /// floor measured live (a start-up transient can leave a few µs).
+    #[test]
+    fn random_heavy_loss_from_the_start_learns_the_period() {
+        for seed in 1..=20u64 {
+            let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+            let mut j = StreamJitter::default();
+            for i in 0..600 {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                if x % 100 >= 60 {
+                    j.observe(85, i * T);
+                }
+            }
+            let t = j.period_ms().unwrap();
+            assert!((t - 83.333).abs() < 0.01, "seed {seed}: T = {t}");
+            assert!(
+                j.jitter_ms().unwrap() < 0.1,
+                "seed {seed}: J = {:?}",
+                j.jitter_ms()
+            );
+        }
+    }
+
+    /// An extra packet during the first gaps doesn't become the seed.
+    #[test]
+    fn an_extra_packet_while_seeding_is_skipped() {
+        let mut j = StreamJitter::default();
+        for i in 0..100 {
+            j.observe(85, i * T);
+            if i == 3 {
+                j.observe(85, i * T + 20 * MS);
+            }
+        }
+        assert!((j.period_ms().unwrap() - 83.333).abs() < 0.01);
     }
 
     /// A small rate change (12 → 10 Hz) is followed.

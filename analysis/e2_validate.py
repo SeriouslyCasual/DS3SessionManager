@@ -1010,7 +1010,11 @@ def print_report(r: dict, baseline: dict | None) -> None:
 
 JIT_GAIN = 16.0
 JIT_PERIOD_WINDOW = 64
-JIT_MIN_PERIOD_SAMPLES = 8
+JIT_MIN_PERIOD_SAMPLES = 16
+# Seed period: this percentile of the first gaps (src/jitter.rs SEED_PERCENTILE).
+JIT_SEED_Q = 0.10
+# The pre-E3 rule needed 8 raw gaps and no seed.
+JIT_OLD_MIN_SAMPLES = 8
 # traffic rows this soon after an endpoint's first row are skipped in the
 # comparison: both estimators need time to forget their different starts.
 JIT_SETTLE_NS = 30_000_000_000
@@ -1021,11 +1025,13 @@ JIT_MATCH_WINDOW_NS = 3_000_000_000
 class StreamJitter:
     """RFC 3550 jitter on the dominant packet size, D = IAT - k*T.
 
-    Same rules as ds3sm: T is the median of the last 64 per-slot gaps (at
-    least 8; raw gaps until T is known, then IAT / k, with k = 0 left out),
+    Same rules as ds3sm: T is the median of the last 64 per-slot gaps; the
+    first 16 raw gaps are rewritten per slot against their 10th percentile
+    (the seed), then each gap enters as IAT / k (k = 0 left out),
     k = round(IAT / T) (half away from zero, as Rust rounds),
     J += (|D| - J) / 16, and a new dominant size restarts the estimate.
-    `per_slot=False` gives the pre-E3 rule (raw gaps), kept for comparison.
+    `per_slot=False` gives the pre-E3 rule (median of raw gaps, from 8, no
+    seed), kept for comparison.
     """
 
     def __init__(self, per_slot: bool = True) -> None:
@@ -1034,13 +1040,26 @@ class StreamJitter:
         self.size: int | None = None
         self.last_ns: int | None = None
         self.iats: list[float] = []
+        self.seeded = False
         self.jitter_ms = 0.0
         self.samples = 0
 
     def period_ms(self) -> float | None:
-        if len(self.iats) < JIT_MIN_PERIOD_SAMPLES:
+        if self.per_slot:
+            return pct(self.iats, 0.5) if self.seeded else None
+        if len(self.iats) < JIT_OLD_MIN_SAMPLES:
             return None
         return pct(self.iats, 0.5)
+
+    def _seed(self) -> None:
+        seed = pct(self.iats, JIT_SEED_Q)
+        out = []
+        for g in self.iats:
+            k = float(int(g / seed + 0.5))
+            if k >= 1:
+                out.append(g / k)
+        self.iats = out
+        self.seeded = len(out) >= JIT_MIN_PERIOD_SAMPLES
 
     def value(self) -> float | None:
         return self.jitter_ms if self.samples else None
@@ -1050,7 +1069,7 @@ class StreamJitter:
         if self.size != size:
             if self.size is not None and self.counts[size] <= self.counts[self.size]:
                 return
-            self.size, self.last_ns, self.iats = size, None, []
+            self.size, self.last_ns, self.iats, self.seeded = size, None, [], False
             self.jitter_ms, self.samples = 0.0, 0
         if self.last_ns is None:
             self.last_ns = t_ns
@@ -1071,6 +1090,8 @@ class StreamJitter:
             self.iats.append(slot)
             if len(self.iats) > JIT_PERIOD_WINDOW:
                 del self.iats[0]
+            if self.per_slot and not self.seeded and len(self.iats) == JIT_MIN_PERIOD_SAMPLES:
+                self._seed()
 
 
 def jitter_track(
