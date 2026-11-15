@@ -74,7 +74,9 @@ CREATE TABLE IF NOT EXISTS tcp_seg (
     remote_ip TEXT NOT NULL,
     remote_port INTEGER NOT NULL,
     kind TEXT NOT NULL,
-    size INTEGER NOT NULL
+    size INTEGER NOT NULL,
+    send_start INTEGER,
+    send_end INTEGER
 );
 CREATE TABLE IF NOT EXISTS geo (
     steam_id INTEGER NOT NULL,
@@ -216,6 +218,7 @@ impl Store {
         let old_geo = rename_old_geo(&conn)?;
         conn.execute_batch(SCHEMA)?;
         add_traffic_columns(&conn)?;
+        add_tcp_seg_columns(&conn)?;
         if old_geo {
             conn.execute_batch(
                 "INSERT INTO geo (steam_id, country, city, lat, lon, accuracy_km, distance_km, fiber_bound_ms)
@@ -286,24 +289,29 @@ impl Store {
 
     /// Append one RTT sample. `id` is `Option` because ETW can time a packet to an
     /// endpoint that Steam hasn't (yet) reported as belonging to a peer.
-    /// Log one steam.exe TCP segment to a peer endpoint (`monitor --tcp`
-    /// only): kind is "send", "recv" or "retx". Lets a capture check the
-    /// kernel's event granularity and the framed sizes segment by segment.
+    /// Log one steam.exe TCP event to a peer endpoint (`monitor --tcp`
+    /// only): kind is "send", "recv", "copy" or "retx", plus a send event's
+    /// raw `startime`/`endtime` fields. Lets a capture check the kernel's
+    /// event granularity and timing event by event.
     pub fn insert_tcp_seg(
         &self,
         t_ns: i128,
         remote: std::net::SocketAddrV4,
         kind: &str,
         size: u32,
+        send_times: Option<(u32, u32)>,
     ) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO tcp_seg VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO tcp_seg (t_ns, remote_ip, remote_port, kind, size, send_start, send_end)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 t_ns as i64,
                 remote.ip().to_string(),
                 remote.port(),
                 kind,
-                size
+                size,
+                send_times.map(|s| s.0),
+                send_times.map(|s| s.1),
             ],
         )?;
         Ok(())
@@ -617,6 +625,20 @@ fn rename_old_geo(conn: &Connection) -> Result<bool> {
 
 /// Run databases from before stream jitter (or the STUN counters) have a
 /// `traffic` table without those columns; add them (NULL for old rows).
+/// `tcp_seg` gained the send-timing columns after the first `--tcp` runs.
+fn add_tcp_seg_columns(conn: &Connection) -> Result<()> {
+    let cols: Vec<String> = conn
+        .prepare("SELECT name FROM pragma_table_info('tcp_seg')")?
+        .query_map([], |r| r.get(0))?
+        .collect::<std::result::Result<_, _>>()?;
+    for name in ["send_start", "send_end"] {
+        if !cols.iter().any(|c| c == name) {
+            conn.execute_batch(&format!("ALTER TABLE tcp_seg ADD COLUMN {name} INTEGER;"))?;
+        }
+    }
+    Ok(())
+}
+
 fn add_traffic_columns(conn: &Connection) -> Result<()> {
     let cols: Vec<String> = conn
         .prepare("SELECT name FROM pragma_table_info('traffic')")?
@@ -800,6 +822,43 @@ mod tests {
         assert_eq!(
             rows,
             vec![("peer".into(), "CA".into()), ("relay".into(), "US".into())]
+        );
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A run file from the first `--tcp` builds gains the send-timing
+    /// columns and accepts rows with and without them.
+    #[test]
+    fn old_tcp_seg_table_gains_send_times() {
+        let dir = std::env::temp_dir().join(format!("ds3sm-mig-tcp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("old.sqlite");
+        {
+            let c = Connection::open(&db).unwrap();
+            c.execute_batch(
+                "CREATE TABLE tcp_seg (t_ns INTEGER NOT NULL, remote_ip TEXT NOT NULL,
+                   remote_port INTEGER NOT NULL, kind TEXT NOT NULL, size INTEGER NOT NULL);
+                 INSERT INTO tcp_seg VALUES (1, '192.0.2.15', 49202, 'send', 99);",
+            )
+            .unwrap();
+        }
+        let s = Store::open(&db).unwrap();
+        let ep = std::net::SocketAddrV4::new(std::net::Ipv4Addr::new(192, 0, 2, 15), 49202);
+        s.insert_tcp_seg(2, ep, "send", 58, Some((10, 12))).unwrap();
+        s.insert_tcp_seg(3, ep, "recv", 70, None).unwrap();
+        let rows: Vec<(i64, Option<i64>, Option<i64>)> = s
+            .conn
+            .prepare("SELECT t_ns, send_start, send_end FROM tcp_seg ORDER BY t_ns")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![(1, None, None), (2, Some(10), Some(12)), (3, None, None)]
         );
         drop(s);
         let _ = std::fs::remove_dir_all(&dir);

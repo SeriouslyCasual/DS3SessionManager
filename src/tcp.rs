@@ -8,26 +8,35 @@
 //! `GetP2PSessionState` reports, it isn't relayed, and it carries the same
 //! datagrams as before, each with a **2-byte length prefix**: the 85 B game
 //! stream arrives as 87 B, Steam's 56 B / 68 B connectivity checks as
-//! 58 B / 70 B. So the UDP methods carry over with sizes + 2:
-//! - RTT: a second [`StunMatcher`] on 58/70 B;
-//! - jitter: a [`StreamJitter`] on the dominant inbound size (87 B);
-//! - loss: TCP never loses a check (it resends), so `nrep%` would read ~0.
-//!   Instead the kernel's **retransmit** events give the share of outbound
-//!   segments sent again. Inbound loss isn't visible (the peer resends).
+//! 58 B / 70 B. What carries over, as validated against a capture in E3-T3:
+//! - **jitter**: a [`StreamJitter`] on the dominant inbound size (87 B).
+//!   Kernel receive events come one per TCP segment with accurate
+//!   timestamps (median +0.016 ms vs the capture), and ds3sm's TCP jitter
+//!   matched the capture's to 0.0006 ms. It includes TCP's own effects
+//!   (sender coalescing, resend delay): 4.2–4.5 ms on the LAN in E3-T3,
+//!   against ~0.35 ms on UDP. That is what the game gets on this path.
+//! - **loss**: TCP never loses a check (it resends), so `nrep%` would read
+//!   ~0. Instead the kernel's **retransmit** events give the share of
+//!   outbound segments sent again. Inbound loss isn't visible.
+//! - **rates and check counts** (a [`StunMatcher`] on 58/70 B, counts only).
 //!
-//! What the numbers mean differs from UDP: RTT and jitter include TCP's own
-//! resend delay (head-of-line blocking). That is what the game gets on this
-//! path, but it isn't the network's raw delay.
+//! What does **not** carry over is RTT. Kernel TCP *send* events come one
+//! per message but are stamped when the data is **acknowledged** (median
+//! +0.46 ms, p95 +51 ms after the wire in E3-T3). The peer's check reply
+//! carries that acknowledgement, so "send" and "reply" land microseconds
+//! apart, and pairing them read 0.009 ms against a true 0.232 ms. So no RTT
+//! is produced on TCP; the send events' own `startime`/`endtime` fields are
+//! logged in `tcp_seg` to see whether a send start can be recovered.
 //!
 //! A segment can hold more than one message (TCP coalescing; 186 B = 99 + 87
 //! was seen). Such segments don't match a known size and are simply not used
-//! for RTT or jitter, never guessed.
+//! for jitter, never guessed.
 //!
 //! # Separation from the UDP method
 //!
 //! Nothing here touches the UDP matcher, traffic maps or relay detectors:
 //! this module has its own state, fed only from the TCP channel, and its
-//! samples are stored with their own source label (`etw_tcp`).
+//! traffic rows carry their own role (`peer_tcp`).
 
 use std::collections::HashMap;
 use std::net::SocketAddrV4;
@@ -35,7 +44,7 @@ use std::net::SocketAddrV4;
 use crate::etw::{TcpKind, TcpSegment};
 use crate::jitter::StreamJitter;
 use crate::monitor::RateWindow;
-use crate::stun::{Datagram, Direction, Matched, StunConfig, StunMatcher};
+use crate::stun::{Datagram, Direction, StunConfig, StunMatcher};
 
 /// Bytes Steam adds in front of each datagram on the TCP fallback.
 pub const FRAME_BYTES: u32 = 2;
@@ -90,15 +99,16 @@ impl TcpPaths {
         }
     }
 
-    /// Feed one segment to a known peer endpoint; returns an RTT sample when
-    /// a framed check reply completes a pair.
-    pub fn observe(&mut self, s: &TcpSegment) -> Option<Matched> {
+    /// Feed one segment to a known peer endpoint. The check matcher only
+    /// counts requests and replies here; its RTT is discarded because send
+    /// timestamps are acknowledgement times (see the module docs).
+    pub fn observe(&mut self, s: &TcpSegment) {
         let p = self.paths.entry(s.remote).or_default();
         let kind = match s.kind {
             TcpKind::Copy => {
                 p.copies += 1;
                 if p.saw_recv {
-                    return None;
+                    return;
                 }
                 TcpKind::Recv
             }
@@ -112,7 +122,7 @@ impl TcpPaths {
             TcpKind::Retransmit => {
                 p.retransmits += 1;
                 p.rate_retx.push(s.t_ns);
-                return None;
+                return;
             }
             TcpKind::Send => {
                 p.pkts_out += 1;
@@ -133,12 +143,12 @@ impl TcpPaths {
                 Direction::Recv
             }
         };
-        self.matcher.observe(&Datagram {
+        let _ = self.matcher.observe(&Datagram {
             t_ns: s.t_ns,
             dir,
             remote: s.remote,
             size: s.size,
-        })
+        });
     }
 
     pub fn path(&self, ep: &SocketAddrV4) -> Option<&TcpPath> {
@@ -181,21 +191,21 @@ mod tests {
             kind,
             remote: peer(),
             size,
+            send_times: None,
         }
     }
 
-    /// Framed checks (58 out, 70 in) pair into RTT samples; unframed
-    /// sizes (56/68) don't.
+    /// Framed checks (58 out, 70 in) are counted; unframed sizes (56/68)
+    /// aren't.
     #[test]
-    fn framed_checks_give_rtt() {
+    fn framed_checks_are_counted() {
         let mut p = TcpPaths::new(56, 68);
-        assert!(p.observe(&seg(0, TcpKind::Send, 58)).is_none());
-        let m = p.observe(&seg(3 * MS, TcpKind::Recv, 70)).unwrap();
-        assert!((m.rtt_ms - 3.0).abs() < 1e-9);
-        assert!(p.observe(&seg(10 * MS, TcpKind::Send, 56)).is_none());
-        assert!(p.observe(&seg(12 * MS, TcpKind::Recv, 68)).is_none());
+        p.observe(&seg(0, TcpKind::Send, 58));
+        p.observe(&seg(3 * MS, TcpKind::Recv, 70));
+        p.observe(&seg(10 * MS, TcpKind::Send, 56));
+        p.observe(&seg(12 * MS, TcpKind::Recv, 68));
         let c = p.counters(&peer());
-        assert_eq!((c.requests, c.matched), (1, 1));
+        assert_eq!((c.requests, c.replies), (1, 1));
     }
 
     /// The framed 87 B game stream gives jitter; a coalesced segment
@@ -221,8 +231,8 @@ mod tests {
     fn copies_stand_in_until_receives_appear() {
         let mut p = TcpPaths::new(56, 68);
         p.observe(&seg(0, TcpKind::Send, 58));
-        let m = p.observe(&seg(2 * MS, TcpKind::Copy, 70)).unwrap();
-        assert!((m.rtt_ms - 2.0).abs() < 1e-9);
+        p.observe(&seg(2 * MS, TcpKind::Copy, 70));
+        assert_eq!(p.counters(&peer()).replies, 1);
         p.observe(&seg(10 * MS, TcpKind::Recv, 87));
         p.observe(&seg(11 * MS, TcpKind::Copy, 87));
         let path = p.path(&peer()).unwrap();

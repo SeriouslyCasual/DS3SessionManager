@@ -367,9 +367,8 @@ struct PeerView {
     /// Whether `path_unseen` is the last logged path event.
     unseen_logged: bool,
     /// Whether the peer is currently measured from Steam's TCP fallback
-    /// (`--tcp`), and the RTT samples from it, kept apart from `rtt`.
+    /// (`--tcp`).
     on_tcp: bool,
-    tcp_rtt: Rolling,
 }
 
 /// How long an active session must stay silent on UDP, beyond the 5 s rate
@@ -435,7 +434,6 @@ impl PeerView {
             unseen_since: None,
             unseen_logged: false,
             on_tcp: false,
-            tcp_rtt: Rolling::new(window),
         }
     }
 
@@ -633,7 +631,7 @@ pub fn run(args: MonitorArgs) -> Result<()> {
         }
         // 1b. Drain TCP fallback events (`--tcp`).
         if let (Some(t), Some(bo), Some(tp)) = (&trace, byte_order, tcp_paths.as_mut()) {
-            drain_tcp(t, bo, steam_pid, tp, &by_endpoint, &mut peers, &store)?;
+            drain_tcp(t, bo, steam_pid, tp, &by_endpoint, &store)?;
         }
 
         if Instant::now() < next_poll {
@@ -1253,15 +1251,14 @@ fn drain_etw(
 /// Move TCP events from the ETW thread into the TCP fallback state
 /// (`--tcp`). Only steam.exe segments to an endpoint Steam reports for a
 /// peer count; Steam's own server connection and everything else is
-/// ignored. RTT samples are stored as `etw_tcp` and kept in the peer's
-/// `tcp_rtt`, never in the UDP statistics.
+/// ignored. No RTT is taken from TCP (send events are stamped at
+/// acknowledgement; see `tcp.rs`), so nothing reaches the RTT table.
 fn drain_tcp(
     t: &etw::UdpTrace,
     bo: ByteOrder,
     steam_pid: u32,
     tcp: &mut TcpPaths,
     by_endpoint: &HashMap<SocketAddrV4, SteamId>,
-    peers: &mut HashMap<SteamId, PeerView>,
     store: &Store,
 ) -> Result<()> {
     let Some(rx) = &t.tcp_rx else {
@@ -1276,27 +1273,17 @@ fn drain_tcp(
         if outbound && s.pid != steam_pid {
             continue;
         }
-        let Some(id) = by_endpoint.get(&s.remote).copied() else {
+        if !by_endpoint.contains_key(&s.remote) {
             continue;
-        };
+        }
         let kind = match s.kind {
             etw::TcpKind::Send => "send",
             etw::TcpKind::Recv => "recv",
             etw::TcpKind::Retransmit => "retx",
             etw::TcpKind::Copy => "copy",
         };
-        store.insert_tcp_seg(s.t_ns, s.remote, kind, s.size)?;
-        if let Some(m) = tcp.observe(&s) {
-            let sample = RttSample {
-                t_ns: m.t_ns,
-                rtt_ms: m.rtt_ms,
-                source: RttSource::EtwTcp,
-            };
-            store.insert_rtt(Some(id), m.remote, &sample)?;
-            if let Some(view) = peers.get_mut(&id) {
-                view.tcp_rtt.push(m.rtt_ms);
-            }
-        }
+        store.insert_tcp_seg(s.t_ns, s.remote, kind, s.size, s.send_times)?;
+        tcp.observe(&s);
     }
     Ok(())
 }
@@ -1430,15 +1417,16 @@ fn draw(
     for id in current {
         let Some(v) = peers.get(id) else { continue };
         // On Steam's TCP fallback (`--tcp`), the row is measured from TCP:
-        // RTT from the framed checks, jitter from the framed stream, and the
-        // loss column shows outbound resends. Otherwise UDP, as always.
+        // jitter from the framed stream, the loss column shows outbound
+        // resends, and RTT is "-" (TCP send events are stamped at
+        // acknowledgement, so no honest RTT). Otherwise UDP, as always.
         let tcp_path = if v.on_tcp {
             tcp.zip(v.state.remote).and_then(|(tp, r)| tp.path(&r))
         } else {
             None
         };
         let s = if tcp_path.is_some() {
-            v.tcp_rtt.summary()
+            None
         } else {
             v.rtt.summary()
         };
@@ -1569,8 +1557,8 @@ fn draw(
     }
     if shown.iter().any(|(_, v)| v.on_tcp) {
         out.push_str(
-            "tcp = Steam moved this connection to its TCP fallback (direct, not a relay): RTT/jit come from \
-             TCP and include its resend delay; nrep% shows outbound resends (r)\n",
+            "tcp = Steam moved this connection to its TCP fallback (direct, not a relay): jit comes from TCP \
+             and includes its resend delay; nrep% shows outbound resends (r); RTT can't be measured on TCP (-)\n",
         );
     }
     let any_relayed = shown.iter().any(|(_, v)| v.evidence.relayed(det));

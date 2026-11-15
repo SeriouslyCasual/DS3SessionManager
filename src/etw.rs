@@ -144,6 +144,10 @@ pub struct RawTcp {
     /// Whether `daddr:dport` is the remote side (else `saddr:sport`),
     /// decided in the callback from steam.exe's known local ports.
     pub remote_is_d: bool,
+    /// Send events only: the event's own `startime` / `endtime` fields
+    /// (units not yet known). Send events are stamped at acknowledgement
+    /// (E3-T3); these may show when the send started.
+    pub send_times: Option<(u32, u32)>,
 }
 
 /// A decoded TCP event: the remote side, as for UDP.
@@ -154,6 +158,7 @@ pub struct TcpSegment {
     pub kind: TcpKind,
     pub remote: SocketAddrV4,
     pub size: u32,
+    pub send_times: Option<(u32, u32)>,
 }
 
 /// FILETIME of the Unix epoch, in 100 ns units.
@@ -235,6 +240,7 @@ impl ByteOrder {
             kind: r.kind,
             remote,
             size: r.size,
+            send_times: r.send_times,
         }
     }
 }
@@ -482,6 +488,10 @@ fn parse_tcp_event(
         sport,
         size: field!("size"),
         remote_is_d,
+        // Optional: a missing field must not drop the event.
+        send_times: (kind == TcpKind::Send)
+            .then(|| Some((p.try_parse("startime").ok()?, p.try_parse("endtime").ok()?)))
+            .flatten(),
     })
 }
 
@@ -782,6 +792,7 @@ mod tests {
                 sport: sport.swap_bytes(),
                 size: 87,
                 remote_is_d,
+                send_times: None,
             };
             let s = bo.decode_tcp(&r);
             assert_eq!(s.remote, want, "{kind:?}");
