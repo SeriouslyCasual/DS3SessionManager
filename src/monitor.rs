@@ -1649,8 +1649,8 @@ fn draw(
     }
     if shown.iter().any(|(_, v)| v.on_tcp) {
         out.push_str(
-            "tcp = Steam moved this connection to its TCP fallback (direct, not a relay): RTT is Windows' own \
-             TCP measurement (whole ms); jit includes TCP's resend delay; nrep% shows outbound resends (r)\n",
+            "tcp = Steam moved this connection to its TCP fallback (direct, not a relay): RTT is the lowest of \
+             Windows' own TCP measurements over 10 s (whole ms); jit includes TCP's resend delay; nrep% shows outbound resends (r)\n",
         );
     }
     let any_relayed = shown.iter().any(|(_, v)| v.evidence.relayed(det));
