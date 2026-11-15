@@ -240,9 +240,16 @@ pub fn pattern(
     })
 }
 
+/// The standard STUN server port (RFC 8489). The relay hosts also run a
+/// STUN server there, which Steam queries for its own NAT discovery even on
+/// direct sessions (seen in the relay-detection test 1: a 20-byte request
+/// and 56-byte reply now and then). That's not the session's traffic.
+pub const STUN_SERVER_PORT: u16 = 3478;
+
 /// All endpoints on `relay_ip` among `keys`, except `exclude` (Steam's own
-/// reported remote, already counted) and endpoints claimed by other peers.
-/// Sorted, so comparing with the previous attribution is a plain `==`.
+/// reported remote, already counted), endpoints claimed by other peers, and
+/// the STUN server port. Sorted, so comparing with the previous attribution
+/// is a plain `==`.
 pub fn group(
     relay_ip: Ipv4Addr,
     keys: impl IntoIterator<Item = SocketAddrV4>,
@@ -251,7 +258,12 @@ pub fn group(
 ) -> Vec<SocketAddrV4> {
     let mut v: Vec<SocketAddrV4> = keys
         .into_iter()
-        .filter(|ep| *ep.ip() == relay_ip && Some(*ep) != exclude && !claimed.contains(ep))
+        .filter(|ep| {
+            *ep.ip() == relay_ip
+                && ep.port() != STUN_SERVER_PORT
+                && Some(*ep) != exclude
+                && !claimed.contains(ep)
+        })
         .collect::<HashSet<_>>()
         .into_iter()
         .collect();
