@@ -1,0 +1,249 @@
+//! RFC 3550 interarrival jitter on a peer's periodic packet stream.
+//!
+//! # The networking idea
+//!
+//! RFC 3550 (RTP) defines jitter from two packets' send and receive times:
+//! `D(i,j) = (Rj - Ri) - (Sj - Si)`, the change in one-way transit time, and
+//! smooths it with `J += (|D| - J) / 16`. Steam's packets are opaque, so the
+//! send times `S` aren't available. But the other player's client sends one
+//! packet size on a strict clock: in the E2 captures, 85-byte packets every
+//! 83.33 ms (12 Hz), arriving as 129 bytes on a wrapped relay port. For a
+//! sender with a fixed period `T`, `Sj - Si = T` for consecutive packets, so:
+//!
+//! ```text
+//! D = inter-arrival - k*T,   k = round(inter-arrival / T)
+//! ```
+//!
+//! - `T` is the median of the last 64 inter-arrival times (the sender's
+//!   period, learned from the stream itself).
+//! - `k` absorbs a lost packet (gap of about 2T, so k = 2 and D is about 0),
+//!   which keeps loss and jitter separate. An extra packet of the same size
+//!   between two slots gets k = 0, so it counts as its offset, not as a gap.
+//! - Delays above T/2 (about 42 ms at 12 Hz) can't be told apart from a
+//!   missing or extra packet; the largest inbound gap shows those.
+//!
+//! Which stream: per endpoint and direction, the packet size seen most often
+//! (the "dominant" size). If another size overtakes it, the estimate starts
+//! over. The first ~8 packets only learn `T`, and `J` starts at 0 (as in
+//! RFC 3550), so it reads low for the first second or two.
+//!
+//! # The Rust idea
+//!
+//! Like `stats.rs`, a plain struct with no I/O, fed one packet at a time and
+//! unit-tested at the bottom of the file.
+
+use std::collections::{HashMap, VecDeque};
+
+/// RFC 3550's smoothing factor: each sample moves the estimate 1/16 of the way.
+const GAIN: f64 = 16.0;
+/// Inter-arrival times kept for the period estimate.
+const PERIOD_WINDOW: usize = 64;
+/// Inter-arrival times needed before the period (and so jitter) is trusted.
+const MIN_PERIOD_SAMPLES: usize = 8;
+
+/// Jitter of one endpoint's packets in one direction.
+#[derive(Default, Clone, Debug)]
+pub struct StreamJitter {
+    /// Packets seen per size, to find the dominant size.
+    counts: HashMap<u32, u64>,
+    /// The size being tracked.
+    size: Option<u32>,
+    /// Arrival (or send) time of the last packet of that size, ns.
+    last_ns: Option<i128>,
+    /// Recent inter-arrival times, ms.
+    iats: VecDeque<f64>,
+    jitter_ms: f64,
+    /// Number of D values fed into `jitter_ms`.
+    samples: u64,
+}
+
+impl StreamJitter {
+    /// Feed one packet: its size in bytes and its kernel timestamp.
+    pub fn observe(&mut self, size: u32, t_ns: i128) {
+        let n = {
+            let c = self.counts.entry(size).or_insert(0);
+            *c += 1;
+            *c
+        };
+        match self.size {
+            Some(s) if s == size => {}
+            // Another size, still not the most common one: ignore it.
+            Some(s) if n <= self.counts[&s] => return,
+            // First packet, or a new dominant size: start over.
+            _ => {
+                self.size = Some(size);
+                self.last_ns = None;
+                self.iats.clear();
+                self.jitter_ms = 0.0;
+                self.samples = 0;
+            }
+        }
+        let Some(prev) = self.last_ns else {
+            self.last_ns = Some(t_ns);
+            return;
+        };
+        // Same tick or out of order (events from different CPUs): skip it.
+        if t_ns <= prev {
+            return;
+        }
+        self.last_ns = Some(t_ns);
+        let iat = (t_ns - prev) as f64 / 1e6;
+        if let Some(t) = self.period_ms() {
+            let k = (iat / t).round();
+            let d = iat - k * t;
+            self.jitter_ms += (d.abs() - self.jitter_ms) / GAIN;
+            self.samples += 1;
+        }
+        if self.iats.len() == PERIOD_WINDOW {
+            self.iats.pop_front();
+        }
+        self.iats.push_back(iat);
+    }
+
+    /// The sender's period `T` (median inter-arrival), once enough are known.
+    pub fn period_ms(&self) -> Option<f64> {
+        if self.iats.len() < MIN_PERIOD_SAMPLES {
+            return None;
+        }
+        let mut v: Vec<f64> = self.iats.iter().copied().collect();
+        v.sort_by(|a, b| a.total_cmp(b));
+        Some(crate::stats::percentile(&v, 50.0))
+    }
+
+    /// The smoothed jitter, ms, or `None` before the first D value.
+    pub fn jitter_ms(&self) -> Option<f64> {
+        (self.samples > 0).then_some(self.jitter_ms)
+    }
+
+    /// The packet size being tracked.
+    pub fn size(&self) -> Option<u32> {
+        self.size
+    }
+
+    /// Time of the last packet of the tracked size, ns.
+    pub fn last_ns(&self) -> Option<i128> {
+        self.last_ns
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MS: i128 = 1_000_000;
+    const T: i128 = 83 * MS + MS / 3; // 83.33 ms, the 12 Hz game stream
+
+    /// Feed `n` packets of `size` on a perfect clock starting at `t0`, each
+    /// delayed by `delay(i)` ns. Returns the time after the last slot.
+    fn feed(
+        j: &mut StreamJitter,
+        size: u32,
+        t0: i128,
+        n: i128,
+        delay: impl Fn(i128) -> i128,
+    ) -> i128 {
+        for i in 0..n {
+            j.observe(size, t0 + i * T + delay(i));
+        }
+        t0 + n * T
+    }
+
+    #[test]
+    fn perfect_clock_has_zero_jitter() {
+        let mut j = StreamJitter::default();
+        feed(&mut j, 85, 0, 200, |_| 0);
+        assert_eq!(j.size(), Some(85));
+        assert!((j.period_ms().unwrap() - 83.333).abs() < 0.01);
+        assert!(j.jitter_ms().unwrap() < 1e-6);
+    }
+
+    #[test]
+    fn no_value_before_the_period_is_known() {
+        let mut j = StreamJitter::default();
+        // n + 1 packets give the n inter-arrival times the period needs.
+        let n = MIN_PERIOD_SAMPLES as i128 + 1;
+        feed(&mut j, 85, 0, n, |_| 0);
+        assert!(j.jitter_ms().is_none());
+        j.observe(85, n * T);
+        assert!(j.jitter_ms().is_some());
+    }
+
+    /// Alternating +a/-a delays give |D| = 2a on every packet, so J
+    /// converges to 2a (RFC 3550's D is the change in transit time).
+    #[test]
+    fn converges_to_mean_abs_transit_change() {
+        let mut j = StreamJitter::default();
+        feed(&mut j, 85, 0, 400, |i| if i % 2 == 0 { MS } else { -MS });
+        assert!(
+            (j.jitter_ms().unwrap() - 2.0).abs() < 0.01,
+            "{:?}",
+            j.jitter_ms()
+        );
+    }
+
+    #[test]
+    fn a_lost_packet_is_not_jitter() {
+        let mut j = StreamJitter::default();
+        for i in 0..200 {
+            if i % 10 != 5 {
+                j.observe(85, i * T);
+            }
+        }
+        assert!(j.jitter_ms().unwrap() < 1e-6);
+        assert!((j.period_ms().unwrap() - 83.333).abs() < 0.01);
+    }
+
+    /// One extra packet 15 ms after a slot adds two |D| of 15 ms (k = 0,
+    /// then k = 1), not a 68 ms spike.
+    #[test]
+    fn an_extra_packet_counts_as_its_offset() {
+        let mut j = StreamJitter::default();
+        let t = feed(&mut j, 85, 0, 100, |_| 0);
+        j.observe(85, t - T + 15 * MS);
+        j.observe(85, t);
+        let want = 15.0 / GAIN + 15.0 * (1.0 - 1.0 / GAIN) / GAIN;
+        assert!(
+            (j.jitter_ms().unwrap() - want).abs() < 1e-6,
+            "{:?}",
+            j.jitter_ms()
+        );
+    }
+
+    /// Other sizes interleaved (the real stream mixes 25/56/68/241 B) don't
+    /// disturb the dominant stream.
+    #[test]
+    fn other_sizes_are_ignored() {
+        let mut j = StreamJitter::default();
+        for i in 0..300 {
+            j.observe(85, i * T);
+            if i % 3 == 0 {
+                j.observe(241, i * T + 7 * MS);
+            }
+            if i % 6 == 0 {
+                j.observe(68, i * T + 40 * MS);
+            }
+        }
+        assert_eq!(j.size(), Some(85));
+        assert!(j.jitter_ms().unwrap() < 1e-6);
+    }
+
+    #[test]
+    fn a_new_dominant_size_restarts_the_estimate() {
+        let mut j = StreamJitter::default();
+        feed(&mut j, 85, 0, 20, |i| if i % 2 == 0 { MS } else { -MS });
+        // A wrapped relay stream takes over: 129 B on the same clock.
+        let t = feed(&mut j, 129, 30 * T, 60, |_| 0);
+        assert_eq!(j.size(), Some(129));
+        assert!(j.jitter_ms().unwrap() < 1e-6);
+        assert_eq!(j.last_ns(), Some(t - T));
+    }
+
+    #[test]
+    fn out_of_order_timestamps_are_skipped() {
+        let mut j = StreamJitter::default();
+        let t = feed(&mut j, 85, 0, 100, |_| 0);
+        j.observe(85, t - 2 * T); // older than the last packet
+        j.observe(85, t);
+        assert!(j.jitter_ms().unwrap() < 1e-6);
+    }
+}

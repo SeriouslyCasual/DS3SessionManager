@@ -24,6 +24,7 @@
 //! | `rtt`       | RTT sample                                     |
 //! | `geo`       | peer's estimated location                      |
 //! | `event`     | notable happening (game restarted, peer left)  |
+//! | `traffic`   | endpoint every 5 s (rates, gaps, jitter)       |
 
 use crate::anon;
 use crate::model::{P2PState, RttSample, SteamId};
@@ -98,7 +99,13 @@ CREATE TABLE IF NOT EXISTS traffic (
     bytes_out INTEGER NOT NULL,
     payload_in INTEGER,
     payload_out INTEGER,
-    max_gap_in_ms REAL NOT NULL
+    max_gap_in_ms REAL NOT NULL,
+    jit_in_ms REAL,
+    stream_in_size INTEGER,
+    period_in_ms REAL,
+    jit_out_ms REAL,
+    stream_out_size INTEGER,
+    period_out_ms REAL
 );
 CREATE INDEX IF NOT EXISTS traffic_by_ep ON traffic (remote_ip, remote_port, t_ns);
 CREATE INDEX IF NOT EXISTS rtt_by_peer ON rtt (steam_id, t_ns);
@@ -167,6 +174,17 @@ pub struct TrafficRow {
     /// endpoints only).
     pub payload: Option<(u64, u64)>,
     pub max_gap_in_ms: f64,
+    /// RFC 3550 jitter of the dominant packet size, in and out (`jitter.rs`).
+    pub jit_in: Option<StreamStats>,
+    pub jit_out: Option<StreamStats>,
+}
+
+/// One direction's periodic stream: its jitter, packet size and period.
+#[derive(Clone, Copy, Debug)]
+pub struct StreamStats {
+    pub jitter_ms: f64,
+    pub size: u32,
+    pub period_ms: f64,
 }
 
 impl Store {
@@ -183,6 +201,7 @@ impl Store {
             .with_context(|| format!("opening run database {}", path.display()))?;
         let old_geo = rename_old_geo(&conn)?;
         conn.execute_batch(SCHEMA)?;
+        add_jitter_columns(&conn)?;
         if old_geo {
             conn.execute_batch(
                 "INSERT INTO geo (steam_id, country, city, lat, lon, accuracy_km, distance_km, fiber_bound_ms)
@@ -314,7 +333,11 @@ impl Store {
     /// Append one traffic snapshot.
     pub fn insert_traffic(&self, r: &TrafficRow) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO traffic VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            "INSERT INTO traffic (t_ns, steam_id, remote_ip, remote_port, role, pps_in, pps_out,
+                 pkts_in, pkts_out, bytes_in, bytes_out, payload_in, payload_out, max_gap_in_ms,
+                 jit_in_ms, stream_in_size, period_in_ms, jit_out_ms, stream_out_size, period_out_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+                     ?15, ?16, ?17, ?18, ?19, ?20)",
             params![
                 r.t_ns as i64,
                 r.steam_id.map(|i| i.0 as i64),
@@ -330,6 +353,12 @@ impl Store {
                 r.payload.map(|p| p.0 as i64),
                 r.payload.map(|p| p.1 as i64),
                 r.max_gap_in_ms,
+                r.jit_in.map(|j| j.jitter_ms),
+                r.jit_in.map(|j| j.size),
+                r.jit_in.map(|j| j.period_ms),
+                r.jit_out.map(|j| j.jitter_ms),
+                r.jit_out.map(|j| j.size),
+                r.jit_out.map(|j| j.period_ms),
             ],
         )?;
         Ok(())
@@ -474,10 +503,17 @@ impl Store {
             "payload_in",
             "payload_out",
             "max_gap_in_ms",
+            "jit_in_ms",
+            "stream_in_size",
+            "period_in_ms",
+            "jit_out_ms",
+            "stream_out_size",
+            "period_out_ms",
         ])?;
         let mut q = self.conn.prepare(
             "SELECT t_ns, steam_id, remote_ip, role, pps_in, pps_out, pkts_in, pkts_out,
-                    bytes_in, bytes_out, payload_in, payload_out, max_gap_in_ms
+                    bytes_in, bytes_out, payload_in, payload_out, max_gap_in_ms,
+                    jit_in_ms, stream_in_size, period_in_ms, jit_out_ms, stream_out_size, period_out_ms
              FROM traffic ORDER BY t_ns",
         )?;
         let mut rows = q.query([])?;
@@ -485,6 +521,7 @@ impl Store {
             let sid: Option<i64> = r.get(1)?;
             let ip: String = r.get(2)?;
             let opt_i = |v: Option<i64>| v.map(|x| x.to_string()).unwrap_or_default();
+            let opt_f = |v: Option<f64>| v.map(|x| format!("{x:.3}")).unwrap_or_default();
             w.write_record([
                 run_label.to_string(),
                 r.get::<_, i64>(0)?.to_string(),
@@ -501,6 +538,12 @@ impl Store {
                 opt_i(r.get(10)?),
                 opt_i(r.get(11)?),
                 format!("{:.1}", r.get::<_, f64>(12)?),
+                opt_f(r.get(13)?),
+                opt_i(r.get(14)?),
+                opt_f(r.get(15)?),
+                opt_f(r.get(16)?),
+                opt_i(r.get(17)?),
+                opt_f(r.get(18)?),
             ])?;
         }
         w.flush()?;
@@ -522,6 +565,28 @@ fn rename_old_geo(conn: &Connection) -> Result<bool> {
     }
     conn.execute_batch("ALTER TABLE geo RENAME TO geo_v1;")?;
     Ok(true)
+}
+
+/// Run databases from before stream jitter have a `traffic` table without
+/// the jitter columns; add them (as NULL for the old rows).
+fn add_jitter_columns(conn: &Connection) -> Result<()> {
+    let cols: Vec<String> = conn
+        .prepare("SELECT name FROM pragma_table_info('traffic')")?
+        .query_map([], |r| r.get(0))?
+        .collect::<std::result::Result<_, _>>()?;
+    for (name, ty) in [
+        ("jit_in_ms", "REAL"),
+        ("stream_in_size", "INTEGER"),
+        ("period_in_ms", "REAL"),
+        ("jit_out_ms", "REAL"),
+        ("stream_out_size", "INTEGER"),
+        ("period_out_ms", "REAL"),
+    ] {
+        if !cols.iter().any(|c| c == name) {
+            conn.execute_batch(&format!("ALTER TABLE traffic ADD COLUMN {name} {ty};"))?;
+        }
+    }
+    Ok(())
 }
 
 /// Convert a stored IP string into its /24 network, or "?" if it doesn't parse.
@@ -589,6 +654,12 @@ mod tests {
             bytes_out: 264,
             payload: Some((850, 136)),
             max_gap_in_ms: 120.0,
+            jit_in: Some(StreamStats {
+                jitter_ms: 2.6789,
+                size: 129,
+                period_ms: 83.333,
+            }),
+            jit_out: None,
         })
         .unwrap();
         let geo = |site| GeoRow {
@@ -619,6 +690,7 @@ mod tests {
         assert!(all.contains("198.51.100.0/24,relay_wrapped"));
         assert!(!all.contains("198.51.100.148"));
         assert!(all.contains(",850,136,"));
+        assert!(all.contains(",2.679,129,83.333,,,"));
         // Peer and relay rows both kept; one peers.csv line carries both.
         let peers = std::fs::read_to_string(out.join("peers.csv")).unwrap();
         assert_eq!(peers.lines().count(), 2);
@@ -672,6 +744,63 @@ mod tests {
             rows,
             vec![("peer".into(), "CA".into()), ("relay".into(), "US".into())]
         );
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A run file from before stream jitter gains the jitter columns, keeps
+    /// its rows (jitter NULL), and accepts new rows with jitter.
+    #[test]
+    fn old_traffic_table_gains_jitter_columns() {
+        let dir = std::env::temp_dir().join(format!("ds3sm-mig-jit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("old.sqlite");
+        {
+            let c = Connection::open(&db).unwrap();
+            c.execute_batch(
+                "CREATE TABLE traffic (t_ns INTEGER NOT NULL, steam_id INTEGER,
+                   remote_ip TEXT NOT NULL, remote_port INTEGER NOT NULL, role TEXT NOT NULL,
+                   pps_in REAL NOT NULL, pps_out REAL NOT NULL, pkts_in INTEGER NOT NULL,
+                   pkts_out INTEGER NOT NULL, bytes_in INTEGER NOT NULL, bytes_out INTEGER NOT NULL,
+                   payload_in INTEGER, payload_out INTEGER, max_gap_in_ms REAL NOT NULL);
+                 INSERT INTO traffic VALUES (1, 7, '192.0.2.1', 1, 'peer', 19.0, 37.0,
+                   1, 1, 85, 97, NULL, NULL, 90.0);",
+            )
+            .unwrap();
+        }
+        let s = Store::open(&db).unwrap();
+        let stream = |j| StreamStats {
+            jitter_ms: j,
+            size: 85,
+            period_ms: 83.3,
+        };
+        s.insert_traffic(&TrafficRow {
+            t_ns: 2,
+            steam_id: Some(SteamId(7)),
+            remote: std::net::SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 1), 1),
+            role: "peer",
+            pps_in: 19.0,
+            pps_out: 37.0,
+            pkts_in: 2,
+            pkts_out: 2,
+            bytes_in: 170,
+            bytes_out: 194,
+            payload: None,
+            max_gap_in_ms: 90.0,
+            jit_in: Some(stream(0.4)),
+            jit_out: Some(stream(0.1)),
+        })
+        .unwrap();
+        let rows: Vec<(i64, Option<f64>, Option<f64>)> = s
+            .conn
+            .prepare("SELECT t_ns, jit_in_ms, jit_out_ms FROM traffic ORDER BY t_ns")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(rows, vec![(1, None, None), (2, Some(0.4), Some(0.1))]);
         drop(s);
         let _ = std::fs::remove_dir_all(&dir);
     }

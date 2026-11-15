@@ -29,11 +29,12 @@ use anyhow::{Context, Result};
 use crate::MonitorArgs;
 use crate::etw::{self, ByteOrder};
 use crate::geo::{self, AsnDb, GeoDb, GeoInfo, LatLon};
+use crate::jitter::StreamJitter;
 use crate::model::{P2PState, Provenance, RttSample, RttSource, SteamId};
 use crate::relay::{self, Detectors, Evidence, Role};
 use crate::stats::Rolling;
 use crate::steam::Steam;
-use crate::store::{GeoRow, GeoSubject, Store, TrafficRow};
+use crate::store::{GeoRow, GeoSubject, Store, StreamStats, TrafficRow};
 use crate::stun::{Direction, StunConfig, StunMatcher};
 use crate::valve::{self, VALVE_ASN};
 use crate::valve_data::Pop;
@@ -265,6 +266,11 @@ struct Traffic {
     /// Timestamps for the packets/second columns.
     rate_in: RateWindow,
     rate_out: RateWindow,
+    /// RFC 3550 jitter of the dominant packet size each way (`jitter.rs`).
+    /// Inbound is the network measure; outbound is this PC's own sending
+    /// regularity, the floor the inbound value can be compared with.
+    jit_in: StreamJitter,
+    jit_out: StreamJitter,
     /// Has sent a request-sized packet / received a reply-sized packet
     /// (the 56/68-byte connectivity checks). Used to recognise relays.
     saw_req: bool,
@@ -296,6 +302,39 @@ fn ep_rates(
         .fold((0.0, 0.0), |(i, o), tr| {
             (i + tr.rate_in.rate(t_now), o + tr.rate_out.rate(t_now))
         })
+}
+
+/// An endpoint's inbound stream jitter. Its packets can sit in either map
+/// (they move when a relay is attributed), so the entry that received the
+/// tracked stream most recently wins.
+fn ep_jitter<'a>(
+    ep: &SocketAddrV4,
+    traffic: &'a HashMap<SocketAddrV4, Traffic>,
+    side: &'a SteamSide,
+) -> Option<&'a StreamJitter> {
+    [traffic.get(ep), side.traffic.get(ep)]
+        .into_iter()
+        .flatten()
+        .map(|tr| &tr.jit_in)
+        .filter(|j| j.jitter_ms().is_some())
+        .max_by_key(|j| j.last_ns())
+}
+
+/// A peer's inbound jitter: that of its busiest inbound endpoint. For a
+/// relayed peer in mode A that's the wrapped relay port carrying the
+/// player's traffic, not Steam's remote (which only returns STUN replies).
+fn peer_jitter(
+    eps: &[SocketAddrV4],
+    traffic: &HashMap<SocketAddrV4, Traffic>,
+    side: &SteamSide,
+    t_now: i128,
+) -> Option<f64> {
+    eps.iter()
+        .filter_map(|e| {
+            ep_jitter(e, traffic, side).map(|j| (ep_rates(e, traffic, side, t_now).0, j))
+        })
+        .max_by(|a, b| a.0.total_cmp(&b.0))
+        .and_then(|(_, j)| j.jitter_ms())
 }
 
 /// Everything the monitor remembers about one peer between polls.
@@ -965,9 +1004,20 @@ fn log_traffic(
                 relay::payload_estimate(r, tr.bytes_in, tr.pkts_in, tr.bytes_out, tr.pkts_out)
             }),
             max_gap_in_ms: tr.max_gap_in_ns as f64 / 1e6,
+            jit_in: stream_stats(&tr.jit_in),
+            jit_out: stream_stats(&tr.jit_out),
         })?;
     }
     Ok(())
+}
+
+/// A stream's jitter, size and period for the log, once it has a value.
+fn stream_stats(j: &StreamJitter) -> Option<StreamStats> {
+    Some(StreamStats {
+        jitter_ms: j.jitter_ms()?,
+        size: j.size()?,
+        period_ms: j.period_ms()?,
+    })
 }
 
 /// The packet-selection rule described on [`drain_etw`], as a pure function
@@ -1038,12 +1088,14 @@ fn drain_etw(
                 tr.pkts_out += 1;
                 tr.bytes_out += d.size as u64;
                 tr.rate_out.push(d.t_ns);
+                tr.jit_out.observe(d.size, d.t_ns);
                 tr.saw_req |= d.size == sizes.0;
             }
             Direction::Recv => {
                 tr.pkts_in += 1;
                 tr.bytes_in += d.size as u64;
                 tr.rate_in.push(d.t_ns);
+                tr.jit_in.observe(d.size, d.t_ns);
                 tr.saw_reply |= d.size == sizes.1;
                 if tr.last_in_ns != 0 {
                     tr.max_gap_in_ns = tr.max_gap_in_ns.max(d.t_ns - tr.last_in_ns);
@@ -1160,15 +1212,16 @@ fn draw(
     out.push_str("\x1b[2J\x1b[H");
     out.push_str("DS3SessionManager - passive monitor (Ctrl+C to stop)\n");
     out.push_str(&format!(
-        "RTT/pps/nrep = {} (ETW); cc/km/bound/infl = {} (GeoIP); '-' = {}\n\n",
+        "RTT/jit/pps/nrep = {} (ETW); cc/km/bound/infl = {} (GeoIP); '-' = {}\n\
+         sd/ipdv = RTT variation; jit = RFC 3550 jitter of the player's 12 Hz inbound stream (ms)\n\n",
         Provenance::Measured.as_str(),
         Provenance::Estimated.as_str(),
         Provenance::Unknown.as_str()
     ));
     out.push_str(&format!(
-        "{:<17} {:<16} {:<3} {:<5} {:<4} {:<21} {:>6} {:>6} {:>6} {:>6} {:>6} {:>5} {:>7} {:>7} {:<6} {:>6} {:>6} {:>5}\n",
+        "{:<17} {:<16} {:<3} {:<5} {:<4} {:<21} {:>6} {:>6} {:>6} {:>6} {:>6} {:>5} {:>5} {:>7} {:>7} {:<6} {:>6} {:>6} {:>5}\n",
         "steam_id", "name", "st", "relay", "via", "remote", "last", "med", "p95", "sd", "ipdv",
-        "nrep%", "pps_in", "pps_out", "cc", "km", "bound", "infl"
+        "jit", "nrep%", "pps_in", "pps_out", "cc", "km", "bound", "infl"
     ));
     for id in current {
         let Some(v) = peers.get(id) else { continue };
@@ -1214,6 +1267,7 @@ fn draw(
             });
             (Some(i), Some(o))
         };
+        let jit = peer_jitter(&eps, traffic, side, t_now);
         // Geo: the player's if known; otherwise the relay's, marked "R:".
         let (cc, km, bound) = match (&v.geo, &v.relay_geo) {
             (Some(g), _) => (
@@ -1243,7 +1297,7 @@ fn draw(
             .take(16)
             .collect();
         out.push_str(&format!(
-            "{:<17} {:<16} {:<3} {:<5} {:<4} {:<21} {:>6} {:>6} {:>6} {:>6} {:>6} {:>5} {:>7} {:>7} {:<6} {:>6} {:>6} {:>5}\n",
+            "{:<17} {:<16} {:<3} {:<5} {:<4} {:<21} {:>6} {:>6} {:>6} {:>6} {:>6} {:>5} {:>5} {:>7} {:>7} {:<6} {:>6} {:>6} {:>5}\n",
             id.to_string(),
             name,
             st,
@@ -1255,6 +1309,7 @@ fn draw(
             opt(s.map(|s| s.p95), 1),
             opt(s.map(|s| s.stddev), 1),
             opt(s.map(|s| s.ipdv), 1),
+            opt(jit, 1),
             opt(noreply, 0),
             opt(pin, 0),
             opt(pout, 0),

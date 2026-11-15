@@ -81,7 +81,8 @@ The program is `target\release\ds3sm.exe`. The build places the required `steam_
 | `via` | Which signs of a relay were seen: `F` Steam's own flag, `P` the traffic pattern, `A` the network owner (needs the ASN database), `L` ds3sm's built-in list of Valve relay addresses. `-` = none. |
 | `remote` | The address the ping is measured to: the player, or the relay server |
 | `last` / `med` / `p95` | Latest, typical and worst-case ping in milliseconds. Through a relay, this is the full round trip to the player and back, not just to the relay. |
-| `sd` / `ipdv` | Two measures of jitter (ms). Lower is smoother. |
+| `sd` / `ipdv` | Two measures of how much the ping varies (ms). Lower is smoother. |
+| `jit` | Jitter of the game data arriving from that player (ms, RFC 3550). The other player's game sends a packet about 12 times a second; this shows how unevenly they arrive. Well below 1 ms on a home network, a few ms through a relay. It's updated with every packet, so it reacts much faster than the ping columns. |
 | `nrep%` | Share of Steam's connection checks that got no reply: a loss estimate |
 | `pps_in` / `pps_out` | Packets per second to and from that player (all relay connections included) |
 | `cc` / `km` | Estimated country and distance. `R:fra` (a relay site code, here Frankfurt) means it's the **relay server's** location, not the player's. |
