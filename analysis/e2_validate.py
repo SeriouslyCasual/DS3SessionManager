@@ -784,7 +784,8 @@ def print_report(r: dict, baseline: dict | None) -> None:
         p(_line("wrong-pair RTT error", a["wrong_pair_rtt_error_ms"], "ms"))
     e = r.get("etw")
     if e:
-        p(f"\nETW vs capture: {e['etw_samples']} ETW samples, matched {e['matched']}, "
+        p(f"\nETW vs capture: {e['etw_samples']} ETW samples during the capture "
+          f"({e['etw_outside_capture']} more outside it, not compared), matched {e['matched']}, "
           f"ETW unmatched {e.get('etw_unmatched', '-')}, capture pairs unmatched in window "
           f"{e.get('capture_unmatched_in_window', '-')}")
         if e.get("matched"):
@@ -868,13 +869,22 @@ def _analyse(capture: str, db: sqlite3.Connection | None, endpoint: tuple[str, i
         "profile": profile(dg),
     }
     if db is not None:
-        etw = load_etw(db, endpoint)
+        etw_all = load_etw(db, endpoint)
+        # Only samples whose reply fell inside the capture can be checked
+        # (the run and the capture rarely start and stop together).
+        if dg:
+            slack = int(tol_ms * 1e6)  # allows for a small clock offset
+            lo, hi = dg[0].t_ns - slack, dg[-1].t_ns + slack
+            etw = [s for s in etw_all if lo <= s.t_ns <= hi]
+        else:
+            etw = etw_all
         # Compare against the capture's ground truth; if the capture shows no
         # RFC STUN at all, fall back to the size rule's pairs so the timing
         # comparison still says something (reported as such).
         ref = truth.pairs if truth.pairs else rule
         e = match_etw(etw, ref, tol_ns=int(tol_ms * 1e6))
         e["reference"] = "transaction_id" if truth.pairs else "size_rule"
+        e["etw_outside_capture"] = len(etw_all) - len(etw)
         e["etw_tick_ns"] = etw_tick_ns(etw)
         label = db.execute("SELECT value FROM meta WHERE key = 'label'").fetchone()
         r["run_label"] = label[0] if label else None
