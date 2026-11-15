@@ -129,6 +129,32 @@ impl GeoDb {
     }
 }
 
+/// An open ASN database (DB-IP "IP to ASN Lite", CC BY 4.0): which network
+/// (autonomous system) an address belongs to. Optional; ds3sm uses it to
+/// recognise Valve relays (detector **A** in `relay.rs`) and to name the
+/// owners of other endpoints the game talks to.
+pub struct AsnDb {
+    reader: maxminddb::Reader<Vec<u8>>,
+}
+
+impl AsnDb {
+    pub fn open(path: &Path) -> Result<Self> {
+        let reader = maxminddb::Reader::open_readfile(path)
+            .with_context(|| format!("opening ASN database {}", path.display()))?;
+        Ok(Self { reader })
+    }
+
+    /// The AS number and organisation name for `ip`, if the database has it.
+    pub fn lookup(&self, ip: IpAddr) -> Option<(u32, Option<String>)> {
+        let res = self.reader.lookup(ip).ok()?;
+        let asn: maxminddb::geoip2::Asn = res.decode().ok()??;
+        Some((
+            asn.autonomous_system_number?,
+            asn.autonomous_system_organization.map(str::to_owned),
+        ))
+    }
+}
+
 /// True for addresses GeoIP can't place: private LAN ranges, loopback,
 /// link-local, carrier-grade NAT, and so on. Your own PCs on the same home
 /// network fall in here.

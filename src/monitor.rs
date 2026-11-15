@@ -18,7 +18,7 @@
 //! it can touch.
 
 use std::collections::{HashMap, HashSet};
-use std::net::{IpAddr, SocketAddrV4};
+use std::net::{IpAddr, Ipv4Addr, SocketAddrV4};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -28,13 +28,15 @@ use anyhow::{Context, Result};
 
 use crate::MonitorArgs;
 use crate::etw::{self, ByteOrder};
-use crate::geo::{self, GeoDb, GeoInfo, LatLon};
+use crate::geo::{self, AsnDb, GeoDb, GeoInfo, LatLon};
 use crate::model::{P2PState, Provenance, RttSample, RttSource, SteamId};
-use crate::relay;
+use crate::relay::{self, Detectors, Evidence, Role};
 use crate::stats::Rolling;
 use crate::steam::Steam;
-use crate::store::{GeoRow, Store};
+use crate::store::{GeoRow, GeoSubject, Store, TrafficRow};
 use crate::stun::{Direction, StunConfig, StunMatcher};
+use crate::valve::{self, VALVE_ASN};
+use crate::valve_data::Pop;
 use crate::win;
 
 /// Current wall-clock time in Unix nanoseconds. If the clock is somehow
@@ -50,7 +52,7 @@ fn now_ns() -> i128 {
 /// `ds3sm probe`: check each prerequisite in turn and print what was found.
 /// Every check reports its own failure instead of stopping the whole command,
 /// so one run shows everything that needs fixing.
-pub fn probe(geo_path: &Path) -> Result<()> {
+pub fn probe(geo_path: &Path, asn_path: &Path) -> Result<()> {
     println!("ds3sm probe");
     println!("  administrator:  {}", win::is_admin());
     match win::find_process(win::DS3_EXE) {
@@ -61,6 +63,16 @@ pub fn probe(geo_path: &Path) -> Result<()> {
         Ok(_) => println!("  GeoIP database: {}", geo_path.display()),
         Err(e) => println!("  GeoIP database: unavailable ({e:#})"),
     }
+    let asndb = match AsnDb::open(asn_path) {
+        Ok(a) => {
+            println!("  ASN database: {}", asn_path.display());
+            Some(a)
+        }
+        Err(e) => {
+            println!("  ASN database: unavailable, relay detector A off ({e:#})");
+            None
+        }
+    };
     // Remote IPs of live P2P sessions, for the per-process breakdown below.
     let mut peer_ips: Vec<std::net::Ipv4Addr> = Vec::new();
     let mut any_peer = false;
@@ -88,6 +100,25 @@ pub fn probe(geo_path: &Path) -> Result<()> {
                     st.error,
                     st.remote
                 );
+                // Relay detectors L and A on Steam's reported remote (P
+                // needs traffic, so only `monitor` evaluates it).
+                if let Some(r) = st.remote {
+                    let ip = *r.ip();
+                    let site = valve::site(ip)
+                        .map(|p| format!("{} {}", p.code, p.desc))
+                        .unwrap_or_else(|| "-".into());
+                    let asn = match &asndb {
+                        Some(db) => db
+                            .lookup(IpAddr::V4(ip))
+                            .map(|(n, o)| format!("AS{n} {}", o.unwrap_or_default()))
+                            .unwrap_or_else(|| "not found".into()),
+                        None => "?".into(),
+                    };
+                    println!(
+                        "      remote is a relay address (L): {}, relay site: {site}, ASN: {asn}",
+                        valve::is_relay_address(ip)
+                    );
+                }
             }
         }
         Err(e) => println!("  Steam: {e:#}"),
@@ -272,13 +303,85 @@ struct PeerView {
     persona: Option<String>,
     state: P2PState,
     rtt: Rolling,
+    /// The **player's** estimated location (never a relay's; see `relay_geo`).
     geo: Option<GeoInfo>,
+    /// The address `geo` was looked up for, so a change triggers a new lookup
+    /// and a relay address taken for the player can be recognised.
+    geo_ip: Option<Ipv4Addr>,
     distance_km: Option<f64>,
     bound_ms: Option<f64>,
     last_logged_state: Option<P2PState>,
-    /// For a relayed peer: the Valve relay endpoint inferred to carry its
-    /// traffic (`relay.rs`). `None` for direct peers or when not inferable.
-    relay_ep: Option<SocketAddrV4>,
+    /// What the four relay detectors say (`relay.rs`), and what was last logged.
+    evidence: Evidence,
+    logged_evidence: Option<Evidence>,
+    /// The relay server's IP, once known.
+    relay_ip: Option<Ipv4Addr>,
+    /// steam.exe endpoints on the relay IP attributed to this peer, besides
+    /// Steam's own reported remote. Sorted.
+    relay_eps: Vec<SocketAddrV4>,
+    /// Where the relay server is (not the player).
+    relay_geo: Option<RelayGeo>,
+}
+
+/// A relay server's location: Steam's relay site if the address matches
+/// one, plus the GeoIP estimate.
+struct RelayGeo {
+    site: Option<&'static Pop>,
+    geo: Option<GeoInfo>,
+    distance_km: Option<f64>,
+    bound_ms: Option<f64>,
+}
+
+/// Read-only inputs to the relay logic, bundled to keep signatures short.
+struct RelayCtx<'a> {
+    detectors: Detectors,
+    asn: Option<&'a AsnDb>,
+    geodb: Option<&'a GeoDb>,
+    home: Option<LatLon>,
+}
+
+impl PeerView {
+    fn new(state: P2PState, window: usize) -> Self {
+        Self {
+            persona: None,
+            state,
+            rtt: Rolling::new(window),
+            geo: None,
+            geo_ip: None,
+            distance_km: None,
+            bound_ms: None,
+            last_logged_state: None,
+            evidence: Evidence::default(),
+            logged_evidence: None,
+            relay_ip: None,
+            relay_eps: Vec::new(),
+            relay_geo: None,
+        }
+    }
+
+    /// Every endpoint whose traffic counts for this peer: Steam's reported
+    /// remote and the attributed relay endpoints.
+    fn endpoints(&self) -> Vec<SocketAddrV4> {
+        let mut v: Vec<SocketAddrV4> = self.state.remote.into_iter().collect();
+        v.extend(
+            self.relay_eps
+                .iter()
+                .filter(|e| Some(**e) != self.state.remote),
+        );
+        v
+    }
+
+    /// The endpoint carrying the 56/68-byte checks (most requests seen),
+    /// i.e. the one the RTT samples come from.
+    fn stun_endpoint(&self, matcher: &StunMatcher) -> Option<SocketAddrV4> {
+        let eps = self.endpoints();
+        eps.iter()
+            .copied()
+            .max_by_key(|e| matcher.counters(e).requests)
+            .filter(|e| matcher.counters(e).requests > 0)
+            .or_else(|| self.relay_eps.first().copied())
+            .or(self.state.remote)
+    }
 }
 
 // ===========================================================================
@@ -330,6 +433,22 @@ pub fn run(args: MonitorArgs) -> Result<()> {
     let home = match (args.home_lat, args.home_lon) {
         (Some(lat), Some(lon)) => Some(LatLon { lat, lon }),
         _ => None,
+    };
+    // Optional ASN database (relay detector A). Without it, A is logged as "?".
+    let asndb = match AsnDb::open(&args.asn) {
+        Ok(a) => Some(a),
+        Err(e) => {
+            eprintln!("note: ASN lookups disabled (relay detector A off): {e:#}");
+            None
+        }
+    };
+    store.set_meta("relay_detect", &args.relay_detect.to_string())?;
+    store.set_meta("asn_db", if asndb.is_some() { "yes" } else { "no" })?;
+    let ctx = RelayCtx {
+        detectors: args.relay_detect,
+        asn: asndb.as_ref(),
+        geodb: geodb.as_ref(),
+        home,
     };
 
     // Step 4. `loop` with `break value` makes the loop itself an expression
@@ -394,6 +513,7 @@ pub fn run(args: MonitorArgs) -> Result<()> {
     let interval = Duration::from_millis(args.interval_ms);
     let mut next_poll = Instant::now();
     let mut last_pid_check = Instant::now();
+    let mut last_traffic_log = Instant::now();
 
     // Main loop. ETW events are drained every ~10 ms, but Steam is polled and
     // the table redrawn only every `interval` (default 500 ms). Packet
@@ -461,25 +581,18 @@ pub fn run(args: MonitorArgs) -> Result<()> {
         steam.run_callbacks();
         let t = now_ns();
         // For each live peer: fetch the name, record that they were seen, update
-        // the in-memory view, log the state only if it changed, remember which
-        // endpoint belongs to them, and geolocate once. Relayed peers are skipped,
-        // because a relay's IP says nothing about where the player is.
+        // the in-memory view, log the state only if it changed, and remember
+        // which endpoint belongs to them. (Geolocation waits until the relay
+        // step has decided whether that endpoint is the player or a relay.)
         // `or_insert_with(|| ...)` only builds the default `PeerView` when
         // the peer is new.
         let active = steam.active_peers();
         for (id, st) in &active {
             let persona = steam.persona(*id);
             store.upsert_peer(*id, persona.as_deref(), t)?;
-            let view = peers.entry(*id).or_insert_with(|| PeerView {
-                persona: None,
-                state: st.clone(),
-                rtt: Rolling::new(args.window),
-                geo: None,
-                distance_km: None,
-                bound_ms: None,
-                last_logged_state: None,
-                relay_ep: None,
-            });
+            let view = peers
+                .entry(*id)
+                .or_insert_with(|| PeerView::new(st.clone(), args.window));
             if persona.is_some() {
                 view.persona = persona;
             }
@@ -490,9 +603,6 @@ pub fn run(args: MonitorArgs) -> Result<()> {
             }
             if let Some(remote) = st.remote {
                 by_endpoint.insert(remote, *id);
-                if view.geo.is_none() && !st.using_relay {
-                    locate(view, *id, remote, geodb.as_ref(), home, &store)?;
-                }
             }
         }
         // `current` = the Steam IDs that are live right now.
@@ -508,16 +618,44 @@ pub fn run(args: MonitorArgs) -> Result<()> {
             }
         }
 
-        // 4. Relayed peers: infer which relay endpoint carries the traffic.
-        attribute_relay(
+        // 4. Relays: run the detectors, attribute relay endpoints, place the relay.
+        update_relays(
             &active,
             &mut peers,
             &mut by_endpoint,
             &mut traffic,
             &side,
+            &ctx,
             &store,
             t,
         )?;
+
+        // 5. Place the player, unless Steam's remote turned out to be a relay.
+        for (id, st) in &active {
+            let (Some(view), Some(remote)) = (peers.get_mut(id), st.remote) else {
+                continue;
+            };
+            if view.evidence.remote_is_relay(&ctx.detectors) {
+                // An address first taken for the player can turn out to be a
+                // relay (pattern evidence needs a few seconds of traffic).
+                if view.geo_ip == Some(*remote.ip()) {
+                    view.geo = None;
+                    view.geo_ip = None;
+                    view.distance_km = None;
+                    view.bound_ms = None;
+                    store.delete_geo(*id, GeoSubject::Peer)?;
+                    store.event(t, "geo_reclassified", &format!("{id} {remote} relay"))?;
+                }
+            } else if view.geo_ip != Some(*remote.ip()) {
+                locate(view, *id, remote, geodb.as_ref(), home, &store)?;
+            }
+        }
+
+        // 6. Traffic snapshot every 5 s.
+        if last_traffic_log.elapsed() >= Duration::from_secs(5) {
+            last_traffic_log = Instant::now();
+            log_traffic(&traffic, &side, &by_endpoint, &peers, &store, t)?;
+        }
 
         if !args.quiet {
             draw(
@@ -527,6 +665,7 @@ pub fn run(args: MonitorArgs) -> Result<()> {
                 &side,
                 &by_endpoint,
                 &matcher,
+                &ctx,
                 trace.is_some(),
             );
         }
@@ -536,72 +675,270 @@ pub fn run(args: MonitorArgs) -> Result<()> {
     Ok(())
 }
 
-/// Re-evaluate the relay attribution after each Steam poll (rule in
-/// `relay.rs`). When the chosen endpoint changes, the old one is removed from
-/// `by_endpoint` and the new one added, so from then on its packets count
-/// for the peer (pps, STUN RTT) exactly like a direct peer's. Each change is
-/// logged as a `relay_attributed` / `relay_unattributed` event.
-fn attribute_relay(
+/// Whether an endpoint has carried both a request-sized send and a
+/// reply-sized receive, in either traffic map.
+fn stun_like(
+    ep: &SocketAddrV4,
+    traffic: &HashMap<SocketAddrV4, Traffic>,
+    side: &SteamSide,
+) -> bool {
+    [traffic.get(ep), side.traffic.get(ep)]
+        .into_iter()
+        .flatten()
+        .any(|tr| tr.saw_req && tr.saw_reply)
+}
+
+#[allow(clippy::too_many_arguments)]
+/// The relay step, after each Steam poll (rules in `relay.rs`):
+/// 1. run the four detectors for every live peer and log changes
+///    (`relay_evidence`);
+/// 2. decide each relayed peer's relay IP (Steam's remote in E2 mode, the
+///    `pick` rule in E1 mode);
+/// 3. attribute every steam.exe endpoint on that IP to the peer, if no other
+///    live peer uses the same relay IP. Added endpoints go into
+///    `by_endpoint`, so from then on their packets count for the peer (pps,
+///    bytes, STUN RTT) exactly like a direct peer's. Each change is logged
+///    as `relay_attributed` / `relay_unattributed` (detail: `<id> <ip:port>`);
+/// 4. place the relay server (site and GeoIP) when the relay IP changes.
+fn update_relays(
     active: &[(SteamId, P2PState)],
     peers: &mut HashMap<SteamId, PeerView>,
     by_endpoint: &mut HashMap<SocketAddrV4, SteamId>,
     traffic: &mut HashMap<SocketAddrV4, Traffic>,
     side: &SteamSide,
+    ctx: &RelayCtx<'_>,
     store: &Store,
     t: i128,
 ) -> Result<()> {
-    let relayed: Vec<SteamId> = active
+    let det = ctx.detectors;
+    let reported: HashMap<SteamId, SocketAddrV4> = active
         .iter()
-        .filter(|(_, st)| st.using_relay)
-        .map(|(id, _)| *id)
+        .filter_map(|(id, st)| st.remote.map(|r| (*id, r)))
         .collect();
-    let claimed: HashSet<SocketAddrV4> = active
-        .iter()
-        .filter(|(_, st)| !st.using_relay)
-        .filter_map(|(_, st)| st.remote)
-        .collect();
-    // Candidates: steam.exe's unclaimed endpoints, plus any endpoint already
-    // attributed (its packets now land in `traffic`, so rates sum both maps).
+    let all_reported: HashSet<SocketAddrV4> = reported.values().copied().collect();
+    // Endpoints Steam reports for peers other than `id`.
+    let others = |id: &SteamId| -> HashSet<SocketAddrV4> {
+        reported
+            .iter()
+            .filter(|(o, _)| *o != id)
+            .map(|(_, r)| *r)
+            .collect()
+    };
+
+    // Candidates: steam.exe's unclaimed endpoints, endpoints already
+    // attributed, and Steam's reported remotes (their packets may sit in
+    // either map, so rates sum both).
     let mut keys: HashSet<SocketAddrV4> = side.traffic.keys().copied().collect();
-    keys.extend(peers.values().filter_map(|v| v.relay_ep));
+    for v in peers.values() {
+        keys.extend(v.relay_eps.iter().copied());
+    }
+    keys.extend(all_reported.iter().copied());
     let candidates: Vec<relay::Candidate> = keys
-        .into_iter()
-        .map(|ep| {
+        .iter()
+        .map(|&ep| {
             let (pin, pout) = ep_rates(&ep, traffic, side, t);
-            let stun_like = [traffic.get(&ep), side.traffic.get(&ep)]
-                .into_iter()
-                .flatten()
-                .any(|tr| tr.saw_req && tr.saw_reply);
             relay::Candidate {
                 ep,
                 pps: pin + pout,
-                stun_like,
+                stun_like: stun_like(&ep, traffic, side),
             }
         })
         .collect();
-    let chosen = relay::pick(relayed.len(), &candidates, &claimed);
+
+    // 1. Evidence.
+    for (id, st) in active {
+        let Some(view) = peers.get_mut(id) else {
+            continue;
+        };
+        let ip = st.remote.map(|r| *r.ip());
+        let ev = Evidence {
+            flag: st.using_relay,
+            pattern: st
+                .remote
+                .is_some_and(|r| relay::pattern(r, &candidates, &others(id))),
+            asn: ctx.asn.map(|db| {
+                ip.and_then(|ip| db.lookup(IpAddr::V4(ip)))
+                    .is_some_and(|(n, _)| n == VALVE_ASN)
+            }),
+            list: ip.is_some_and(valve::is_relay_address),
+        };
+        view.evidence = ev;
+        if view.logged_evidence != Some(ev) {
+            let remote = st
+                .remote
+                .map(|r| r.to_string())
+                .unwrap_or_else(|| "-".into());
+            store.event(
+                t,
+                "relay_evidence",
+                &format!(
+                    "{id} {} relayed={} remote={remote}",
+                    ev.log_detail(),
+                    u8::from(ev.relayed(&det))
+                ),
+            )?;
+            view.logged_evidence = Some(ev);
+        }
+    }
+
+    // 2. Relay IP per peer.
+    let flag_only: Vec<SteamId> = active
+        .iter()
+        .map(|(id, _)| *id)
+        .filter(|id| {
+            peers
+                .get(id)
+                .is_some_and(|v| v.evidence.relayed(&det) && !v.evidence.remote_is_relay(&det))
+        })
+        .collect();
+    let e1_ep = relay::pick(flag_only.len(), &candidates, &all_reported);
+    let mut want_ip: HashMap<SteamId, Ipv4Addr> = HashMap::new();
+    for (id, st) in active {
+        let Some(v) = peers.get(id) else { continue };
+        if v.evidence.remote_is_relay(&det) {
+            if let Some(r) = st.remote {
+                want_ip.insert(*id, *r.ip());
+            }
+        } else if flag_only.first() == Some(id)
+            && let Some(ep) = e1_ep
+        {
+            want_ip.insert(*id, *ep.ip());
+        }
+    }
+    let mut users: HashMap<Ipv4Addr, usize> = HashMap::new();
+    for ip in want_ip.values() {
+        *users.entry(*ip).or_default() += 1;
+    }
+
+    // 3 and 4. Attribute, and place the relay. Peers that left get nothing.
     for (id, view) in peers.iter_mut() {
-        let want = match (relayed.first(), chosen) {
-            (Some(r), Some(ep)) if r == id => Some(ep),
+        let ip = want_ip.get(id).copied();
+        let want = match ip {
+            Some(ip) if users.get(&ip) == Some(&1) => relay::group(
+                ip,
+                keys.iter().copied(),
+                reported.get(id).copied(),
+                &others(id),
+            ),
+            _ => Vec::new(),
+        };
+        if want != view.relay_eps {
+            for old in view.relay_eps.iter().filter(|e| !want.contains(e)) {
+                by_endpoint.remove(old);
+                // Its counters were steam.exe's, not the game's: drop them so
+                // the relay never shows up in the game's "unattributed" list.
+                traffic.remove(old);
+                store.event(t, "relay_unattributed", &format!("{id} {old}"))?;
+            }
+            for new in want.iter().filter(|e| !view.relay_eps.contains(e)) {
+                by_endpoint.insert(*new, *id);
+                store.event(t, "relay_attributed", &format!("{id} {new}"))?;
+            }
+            view.relay_eps = want;
+        }
+        if view.relay_ip != ip {
+            view.relay_ip = ip;
+            view.relay_geo = None;
+            if let Some(ip) = ip {
+                locate_relay(view, *id, ip, ctx, store)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Place a relay server: Steam's relay site if its /24 matches one (Valve's
+/// published coordinates), plus the GeoIP estimate. Distance and bound are
+/// to the **relay**, and stored as a `relay` geo row.
+fn locate_relay(
+    view: &mut PeerView,
+    id: SteamId,
+    ip: Ipv4Addr,
+    ctx: &RelayCtx<'_>,
+    store: &Store,
+) -> Result<()> {
+    let site = valve::site(ip);
+    let g = ctx.geodb.and_then(|db| db.lookup(IpAddr::V4(ip)));
+    let loc = site
+        .map(|p| LatLon {
+            lat: p.lat,
+            lon: p.lon,
+        })
+        .or(g.as_ref().and_then(|g| g.location));
+    let (distance_km, bound_ms) = match (ctx.home, loc) {
+        (Some(h), Some(l)) => {
+            let d = geo::great_circle_km(h, l);
+            (Some(d), Some(geo::fiber_rtt_lower_bound_ms(d)))
+        }
+        _ => (None, None),
+    };
+    store.upsert_geo(
+        id,
+        GeoSubject::Relay,
+        &GeoRow {
+            country: g.as_ref().and_then(|g| g.country.as_deref()),
+            city: g.as_ref().and_then(|g| g.city.as_deref()),
+            lat: loc.map(|l| l.lat),
+            lon: loc.map(|l| l.lon),
+            // Site coordinates are Valve's own; GeoIP's radius doesn't apply.
+            accuracy_km: if site.is_some() {
+                None
+            } else {
+                g.as_ref().and_then(|g| g.accuracy_km)
+            },
+            distance_km,
+            fiber_bound_ms: bound_ms,
+            site: site.map(|p| p.code),
+        },
+    )?;
+    view.relay_geo = Some(RelayGeo {
+        site,
+        geo: g,
+        distance_km,
+        bound_ms,
+    });
+    Ok(())
+}
+
+/// Write one `traffic` row per counted endpoint (peers, relays, the game's
+/// other contacts): rates, running totals, the largest inbound gap, and for
+/// wrapped relay endpoints the payload estimate.
+fn log_traffic(
+    traffic: &HashMap<SocketAddrV4, Traffic>,
+    side: &SteamSide,
+    by_endpoint: &HashMap<SocketAddrV4, SteamId>,
+    peers: &HashMap<SteamId, PeerView>,
+    store: &Store,
+    t: i128,
+) -> Result<()> {
+    for (ep, tr) in traffic {
+        let owner = by_endpoint.get(ep).copied();
+        let role = match owner.and_then(|id| peers.get(&id)) {
+            Some(v) if v.relay_ip == Some(*ep.ip()) => Some(Role::of(stun_like(ep, traffic, side))),
             _ => None,
         };
-        if view.relay_ep == want {
-            continue;
-        }
-        if let Some(old) = view.relay_ep {
-            by_endpoint.remove(&old);
-            // Its counters were steam.exe's, not the game's: drop them so the
-            // relay never shows up in the game's "unattributed" list.
-            traffic.remove(&old);
-        }
-        match want {
-            Some(ep) => {
-                by_endpoint.insert(ep, *id);
-                store.event(t, "relay_attributed", &format!("{id} {ep}"))?;
-            }
-            None => store.event(t, "relay_unattributed", &id.to_string())?,
-        }
-        view.relay_ep = want;
+        let role_str = match (role, owner) {
+            (Some(r), _) => r.as_str(),
+            (None, Some(_)) => "peer",
+            (None, None) => "game",
+        };
+        let (pps_in, pps_out) = ep_rates(ep, traffic, side, t);
+        store.insert_traffic(&TrafficRow {
+            t_ns: t,
+            steam_id: owner,
+            remote: *ep,
+            role: role_str,
+            pps_in,
+            pps_out,
+            pkts_in: tr.pkts_in,
+            pkts_out: tr.pkts_out,
+            bytes_in: tr.bytes_in,
+            bytes_out: tr.bytes_out,
+            payload: role.and_then(|r| {
+                relay::payload_estimate(r, tr.bytes_in, tr.pkts_in, tr.bytes_out, tr.pkts_out)
+            }),
+            max_gap_in_ms: tr.max_gap_in_ns as f64 / 1e6,
+        })?;
     }
     Ok(())
 }
@@ -727,6 +1064,12 @@ fn locate(
     store: &Store,
 ) -> Result<()> {
     let ip = IpAddr::V4(*remote.ip());
+    // Remember the address even if the lookup finds nothing, so it isn't
+    // retried on every poll; a new address triggers a new lookup.
+    view.geo_ip = Some(*remote.ip());
+    view.geo = None;
+    view.distance_km = None;
+    view.bound_ms = None;
     let Some(db) = geodb else { return Ok(()) };
     if geo::is_non_public(ip) {
         return Ok(());
@@ -739,6 +1082,7 @@ fn locate(
         }
         store.upsert_geo(
             id,
+            GeoSubject::Peer,
             &GeoRow {
                 country: g.country.as_deref(),
                 city: g.city.as_deref(),
@@ -747,6 +1091,7 @@ fn locate(
                 accuracy_km: g.accuracy_km,
                 distance_km: view.distance_km,
                 fiber_bound_ms: view.bound_ms,
+                site: None,
             },
         )?;
         view.geo = Some(g);
@@ -768,9 +1113,10 @@ fn opt(v: Option<f64>, prec: usize) -> String {
 /// avoids flicker. `\x1b[2J\x1b[H` is the ANSI escape sequence for "clear
 /// screen, move cursor to top-left".
 ///
-/// Below the peer table it lists "unattributed" endpoints: addresses the game
-/// exchanges packets with that no Steam session claims (relays, matchmaking
-/// servers, or peers missing from the coplay list).
+/// Below the peer table it lists, for relayed peers, the relay server and
+/// each relay endpoint; then "unattributed" endpoints: addresses the game
+/// exchanges packets with that no Steam session claims (matchmaking servers,
+/// or peers missing from the coplay list).
 fn draw(
     peers: &HashMap<SteamId, PeerView>,
     current: &[SteamId],
@@ -778,8 +1124,10 @@ fn draw(
     side: &SteamSide,
     by_endpoint: &HashMap<SocketAddrV4, SteamId>,
     matcher: &StunMatcher,
+    ctx: &RelayCtx<'_>,
     etw_on: bool,
 ) {
+    let det = &ctx.detectors;
     let t_now = now_ns();
     let mut out = String::new();
     out.push_str("\x1b[2J\x1b[H");
@@ -791,9 +1139,9 @@ fn draw(
         Provenance::Unknown.as_str()
     ));
     out.push_str(&format!(
-        "{:<17} {:<16} {:<3} {:<5} {:<21} {:>6} {:>6} {:>6} {:>6} {:>6} {:>5} {:>7} {:>7} {:<3} {:>6} {:>6} {:>5}\n",
-        "steam_id", "name", "st", "relay", "remote", "last", "med", "p95", "sd", "ipdv", "nrep%",
-        "pps_in", "pps_out", "cc", "km", "bound", "infl"
+        "{:<17} {:<16} {:<3} {:<5} {:<4} {:<21} {:>6} {:>6} {:>6} {:>6} {:>6} {:>5} {:>7} {:>7} {:<6} {:>6} {:>6} {:>5}\n",
+        "steam_id", "name", "st", "relay", "via", "remote", "last", "med", "p95", "sd", "ipdv",
+        "nrep%", "pps_in", "pps_out", "cc", "km", "bound", "infl"
     ));
     for id in current {
         let Some(v) = peers.get(id) else { continue };
@@ -805,28 +1153,59 @@ fn draw(
         } else {
             "-"
         };
-        // For a relayed peer with an inferred relay endpoint, everything
-        // measured (remote, pps, RTT, nrep) refers to that relay endpoint.
-        let ep = v.relay_ep.or(v.state.remote);
-        let remote = ep.map(|r| r.to_string()).unwrap_or_else(|| "-".into());
-        let relay_col = match (v.relay_ep, v.state.using_relay) {
-            (Some(_), _) => "yes*",
-            (None, true) => "yes",
-            (None, false) => "no",
+        // For a relayed peer, `remote` is the relay endpoint carrying the
+        // checks (where RTT and nrep come from); pps sums every endpoint
+        // counted for the peer.
+        let stun_ep = v.stun_endpoint(matcher);
+        let shown_ep = if v.relay_eps.is_empty() {
+            v.state.remote
+        } else {
+            stun_ep
         };
-        let (pin, pout, noreply) = match ep {
-            Some(r) => {
-                let c = matcher.counters(&r);
-                let nr = (c.requests > 0).then(|| {
-                    100.0 * (c.requests.saturating_sub(c.matched)) as f64 / c.requests as f64
-                });
-                let (pin, pout) = ep_rates(&r, traffic, side, t_now);
-                (Some(pin), Some(pout), nr)
+        let remote = shown_ep
+            .map(|r| r.to_string())
+            .unwrap_or_else(|| "-".into());
+        let relayed = v.evidence.relayed(det);
+        let inferred = !v.relay_eps.is_empty() || v.evidence.remote_is_relay(det);
+        let relay_col = match (relayed, inferred) {
+            (true, true) => "yes*",
+            (true, false) => "yes",
+            _ => "no",
+        };
+        let noreply = stun_ep.and_then(|r| {
+            let c = matcher.counters(&r);
+            (c.requests > 0)
+                .then(|| 100.0 * (c.requests.saturating_sub(c.matched)) as f64 / c.requests as f64)
+        });
+        let eps = v.endpoints();
+        let (pin, pout) = if eps.is_empty() {
+            (None, None)
+        } else {
+            let (i, o) = eps.iter().fold((0.0, 0.0), |(i, o), e| {
+                let (a, b) = ep_rates(e, traffic, side, t_now);
+                (i + a, o + b)
+            });
+            (Some(i), Some(o))
+        };
+        // Geo: the player's if known; otherwise the relay's, marked "R:".
+        let (cc, km, bound) = match (&v.geo, &v.relay_geo) {
+            (Some(g), _) => (
+                g.country.clone().unwrap_or_else(|| "-".into()),
+                v.distance_km,
+                v.bound_ms,
+            ),
+            (None, Some(r)) => {
+                let tag = r
+                    .site
+                    .map(|p| p.code.to_string())
+                    .or_else(|| r.geo.as_ref().and_then(|g| g.country.clone()))
+                    .unwrap_or_else(|| "?".into());
+                (format!("R:{tag}"), r.distance_km, r.bound_ms)
             }
-            None => (None, None, None),
+            (None, None) => ("-".into(), None, None),
         };
-        let infl = match (s, v.bound_ms) {
-            (Some(s), Some(b)) if b > 0.5 => Some(s.median / b),
+        let infl = match (s, v.bound_ms, &v.geo) {
+            (Some(s), Some(b), Some(_)) if b > 0.5 => Some(s.median / b),
             _ => None,
         };
         let name: String = v
@@ -837,11 +1216,12 @@ fn draw(
             .take(16)
             .collect();
         out.push_str(&format!(
-            "{:<17} {:<16} {:<3} {:<5} {:<21} {:>6} {:>6} {:>6} {:>6} {:>6} {:>5} {:>7} {:>7} {:<3} {:>6} {:>6} {:>5}\n",
+            "{:<17} {:<16} {:<3} {:<5} {:<4} {:<21} {:>6} {:>6} {:>6} {:>6} {:>6} {:>5} {:>7} {:>7} {:<6} {:>6} {:>6} {:>5}\n",
             id.to_string(),
             name,
             st,
             relay_col,
+            v.evidence.letters(),
             remote,
             opt(s.map(|s| s.last), 1),
             opt(s.map(|s| s.median), 1),
@@ -851,79 +1231,157 @@ fn draw(
             opt(noreply, 0),
             opt(pin, 0),
             opt(pout, 0),
-            v.geo.as_ref().and_then(|g| g.country.clone()).unwrap_or_else(|| "-".into()),
-            opt(v.distance_km, 0),
-            opt(v.bound_ms, 1),
+            cc,
+            opt(km, 0),
+            opt(bound, 1),
             opt(infl, 1),
         ));
     }
     if current.is_empty() {
         out.push_str("(no active P2P sessions)\n");
     }
-    let shown: Vec<&PeerView> = current.iter().filter_map(|id| peers.get(id)).collect();
-    if shown.iter().any(|v| v.relay_ep.is_some()) {
-        out.push_str(
-            "yes* = relayed; remote/RTT/pps are on the Valve relay endpoint inferred from steam.exe traffic\n",
-        );
-    }
-    let relayed_unknown = shown
+    let shown: Vec<(SteamId, &PeerView)> = current
         .iter()
-        .any(|v| v.state.using_relay && v.relay_ep.is_none());
-    if relayed_unknown {
+        .filter_map(|id| peers.get(id).map(|v| (*id, v)))
+        .collect();
+    let any_relayed = shown.iter().any(|(_, v)| v.evidence.relayed(det));
+    if any_relayed {
+        out.push_str(&format!(
+            "via: relay evidence (F Steam flag, P traffic pattern, A ASN, L Valve list; deciding: {det})\n\
+             yes* = relayed, relay endpoints inferred by ds3sm; yes = Steam's flag only, relay not found\n"
+        ));
+    }
+    if shown
+        .iter()
+        .any(|(_, v)| v.geo.is_none() && v.relay_geo.is_some())
+    {
         out.push_str(
-            "yes  = relayed; Steam reports the peer's public address, not the relay; no relay endpoint inferred\n",
+            "R:xxx = location of the Valve relay server (site code), NOT the player; km/bound are to the relay\n",
         );
     }
-    if etw_on && shown.iter().any(|v| v.state.using_relay) {
-        // steam.exe endpoints that look like a game session through a relay
-        // (game-rate traffic with request/reply-sized packets).
-        let mut keys: HashSet<SocketAddrV4> = side.traffic.keys().copied().collect();
-        keys.extend(shown.iter().filter_map(|v| v.relay_ep));
-        let mut rows: Vec<(SocketAddrV4, f64, f64)> = keys
+
+    // Relay details: the relay server and every endpoint counted for the peer.
+    for (_, v) in shown.iter().filter(|(_, v)| v.relay_ip.is_some()) {
+        let Some(rip) = v.relay_ip else { continue };
+        let name = v.persona.clone().unwrap_or_else(|| "?".into());
+        let place = match &v.relay_geo {
+            Some(r) => {
+                let site = r
+                    .site
+                    .map(|p| {
+                        let host = if p.valve_hosted {
+                            ""
+                        } else {
+                            ", partner-hosted"
+                        };
+                        format!("site {} {}{host}", p.code, p.desc)
+                    })
+                    .unwrap_or_else(|| "site unknown".into());
+                let g = r
+                    .geo
+                    .as_ref()
+                    .map(|g| {
+                        format!(
+                            "GeoIP {} {}",
+                            g.country.as_deref().unwrap_or("?"),
+                            g.city.as_deref().unwrap_or("")
+                        )
+                    })
+                    .unwrap_or_default();
+                format!("{site}; {g}")
+            }
+            None => "location unknown".into(),
+        };
+        out.push_str(&format!(
+            "\nRelay for {name}: {rip} ({place}); evidence {}\n",
+            v.evidence.log_detail()
+        ));
+        out.push_str(&format!(
+            "  {:<21} {:<8} {:>6} {:>6} {:>9} {:>9} {:>11} {:>11}\n",
+            "endpoint", "role", "pps_in", "out", "KB_in", "KB_out", "payload_in", "payload_out"
+        ));
+        let mut eps: Vec<SocketAddrV4> = v
+            .endpoints()
             .into_iter()
-            .filter_map(|ep| {
+            .filter(|e| *e.ip() == rip)
+            .collect();
+        eps.sort();
+        for e in eps {
+            let (pin, pout) = ep_rates(&e, traffic, side, t_now);
+            let (mut bi, mut bo, mut ni, mut no) = (0u64, 0u64, 0u64, 0u64);
+            for tr in [traffic.get(&e), side.traffic.get(&e)]
+                .into_iter()
+                .flatten()
+            {
+                bi += tr.bytes_in;
+                bo += tr.bytes_out;
+                ni += tr.pkts_in;
+                no += tr.pkts_out;
+            }
+            let role = Role::of(stun_like(&e, traffic, side));
+            let pay = relay::payload_estimate(role, bi, ni, bo, no);
+            let kb = |b: u64| format!("{:.1}", b as f64 / 1024.0);
+            let tag = if Some(e) == v.state.remote {
+                format!("{}(S)", if role == Role::Stun { "stun" } else { "wrap" })
+            } else if role == Role::Stun {
+                "stun".into()
+            } else {
+                "wrapped".into()
+            };
+            out.push_str(&format!(
+                "  {:<21} {:<8} {:>6.0} {:>6.0} {:>9} {:>9} {:>11} {:>11}\n",
+                e.to_string(),
+                tag,
+                pin,
+                pout,
+                kb(bi),
+                kb(bo),
+                pay.map(|p| kb(p.0)).unwrap_or_else(|| "-".into()),
+                pay.map(|p| kb(p.1)).unwrap_or_else(|| "-".into()),
+            ));
+        }
+        out.push_str(
+            "  (S) = Steam's reported remote; payload = KB minus relay headers (44 B in, 64 B out per packet; estimated)\n",
+        );
+    }
+
+    if etw_on && any_relayed {
+        // Game-like steam.exe endpoints that no peer claims (e.g. several
+        // relayed peers sharing one relay server).
+        let mut rows: Vec<(SocketAddrV4, f64, f64)> = side
+            .traffic
+            .keys()
+            .filter(|ep| !by_endpoint.contains_key(ep))
+            .filter_map(|&ep| {
                 let (pin, pout) = ep_rates(&ep, traffic, side, t_now);
-                let stun_like = [traffic.get(&ep), side.traffic.get(&ep)]
-                    .into_iter()
-                    .flatten()
-                    .any(|tr| tr.saw_req && tr.saw_reply);
                 let c = relay::Candidate {
                     ep,
                     pps: pin + pout,
-                    stun_like,
+                    stun_like: stun_like(&ep, traffic, side),
                 };
                 c.looks_like_game().then_some((ep, pin, pout))
             })
             .collect();
         rows.sort_by(|a, b| (b.1 + b.2).total_cmp(&(a.1 + a.2)));
-        out.push_str("\nRelay endpoints (steam.exe, game-rate traffic):\n");
-        if rows.is_empty() {
-            out.push_str("  none yet\n");
+        if !rows.is_empty() {
+            out.push_str("\nUnattributed relay-like endpoints (steam.exe, game-rate traffic):\n");
         }
         for (ep, pin, pout) in rows.into_iter().take(5) {
-            let owner = by_endpoint.get(&ep).and_then(|id| peers.get(id));
-            let s = match owner {
-                Some(v) => v.rtt.summary(),
-                None => side.rtt.get(&ep).and_then(|r| r.summary()),
-            };
-            let who = owner
-                .and_then(|v| v.persona.clone())
-                .map(|n| format!("-> {n}"))
-                .unwrap_or_else(|| "(not attributed)".into());
+            let s = side.rtt.get(&ep).and_then(|r| r.summary());
             out.push_str(&format!(
-                "  {:<21} pps in {:>4.0} out {:>4.0}  RTT med {:>6} p95 {:>6}  {}\n",
+                "  {:<21} pps in {:>4.0} out {:>4.0}  RTT med {:>6} p95 {:>6}\n",
                 ep.to_string(),
                 pin,
                 pout,
                 opt(s.map(|s| s.median), 1),
                 opt(s.map(|s| s.p95), 1),
-                who
             ));
         }
     }
     if etw_on {
         // Endpoints the game talks to that no Steam session claims
-        // (relays, matchmaking servers, peers missing from the coplay list).
+        // (matchmaking servers, peers missing from the coplay list), with
+        // the network that owns each address when the ASN database is loaded.
         let mut other: Vec<(&SocketAddrV4, &Traffic)> = traffic
             .iter()
             .filter(|(ep, _)| !by_endpoint.contains_key(ep))
@@ -932,8 +1390,13 @@ fn draw(
         if !other.is_empty() {
             out.push_str("\nOther UDP endpoints of the game (unattributed):\n");
             for (ep, t) in other.into_iter().take(6) {
+                let owner = ctx
+                    .asn
+                    .and_then(|db| db.lookup(IpAddr::V4(*ep.ip())))
+                    .map(|(n, org)| format!("  AS{n} {}", org.unwrap_or_default()))
+                    .unwrap_or_default();
                 out.push_str(&format!(
-                    "  {:<21} in {:>7} pkts  out {:>7} pkts  max_gap {:>6.0} ms\n",
+                    "  {:<21} in {:>7} pkts  out {:>7} pkts  max_gap {:>6.0} ms{owner}\n",
                     ep.to_string(),
                     t.pkts_in,
                     t.pkts_out,
@@ -984,6 +1447,252 @@ mod tests {
     fn missing_steam_pid_matches_nothing() {
         let (peer, m) = peer_map();
         assert!(!counts_packet(STEAM, peer, GAME, u32::MAX, &m));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests: the relay step on synthetic traffic (E1 and E2 layouts).
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod relay_step_tests {
+    use super::*;
+
+    const T: i128 = 1_000_000_000_000_000;
+
+    fn state(relay: bool, remote: SocketAddrV4) -> P2PState {
+        P2PState {
+            active: true,
+            connecting: false,
+            error: 0,
+            using_relay: relay,
+            bytes_queued: 0,
+            packets_queued: 0,
+            remote: Some(remote),
+        }
+    }
+
+    /// Traffic at `pin`/`pout` packets/s over the 10 s before `T`.
+    fn tr(pin: i128, pout: i128, stun: bool) -> Traffic {
+        let mut t = Traffic {
+            saw_req: stun,
+            saw_reply: stun,
+            ..Default::default()
+        };
+        for i in 0..(10 * pin) {
+            t.rate_in.push(T - 10_000_000_000 + i * 1_000_000_000 / pin);
+            t.pkts_in += 1;
+            t.bytes_in += 129;
+        }
+        for i in 0..(10 * pout) {
+            t.rate_out
+                .push(T - 10_000_000_000 + i * 1_000_000_000 / pout);
+            t.pkts_out += 1;
+        }
+        t
+    }
+
+    struct Rig {
+        peers: HashMap<SteamId, PeerView>,
+        by_endpoint: HashMap<SocketAddrV4, SteamId>,
+        traffic: HashMap<SocketAddrV4, Traffic>,
+        side: SteamSide,
+        store: Store,
+        dir: std::path::PathBuf,
+    }
+
+    impl Rig {
+        fn new(tag: &str) -> Self {
+            let dir =
+                std::env::temp_dir().join(format!("ds3sm-relay-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            let store = Store::open(&dir.join("run.sqlite")).unwrap();
+            Rig {
+                peers: HashMap::new(),
+                by_endpoint: HashMap::new(),
+                traffic: HashMap::new(),
+                side: SteamSide {
+                    traffic: HashMap::new(),
+                    rtt: HashMap::new(),
+                    window: 20,
+                },
+                store,
+                dir,
+            }
+        }
+
+        /// Register live peers as the poll loop does, then run the relay step.
+        fn step(&mut self, active: &[(SteamId, P2PState)], det: &str) {
+            for (id, st) in active {
+                self.peers
+                    .entry(*id)
+                    .or_insert_with(|| PeerView::new(st.clone(), 20))
+                    .state = st.clone();
+                if let Some(r) = st.remote {
+                    self.by_endpoint.insert(r, *id);
+                }
+            }
+            let ctx = RelayCtx {
+                detectors: det.parse().unwrap(),
+                asn: None,
+                geodb: None,
+                home: Some(LatLon {
+                    lat: 48.4,
+                    lon: -123.4,
+                }),
+            };
+            update_relays(
+                active,
+                &mut self.peers,
+                &mut self.by_endpoint,
+                &mut self.traffic,
+                &self.side,
+                &ctx,
+                &self.store,
+                T,
+            )
+            .unwrap();
+        }
+
+        fn events(&self, kind: &str) -> Vec<String> {
+            let mut q = self
+                .store
+                .conn_for_tests()
+                .prepare("SELECT detail FROM event WHERE kind = ?1 ORDER BY rowid")
+                .unwrap();
+            q.query_map([kind], |r| r.get(0))
+                .unwrap()
+                .collect::<std::result::Result<_, _>>()
+                .unwrap()
+        }
+    }
+
+    impl Drop for Rig {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// A host in the Seattle relay site's /24 (not a real relay address).
+    fn relay(port: u16) -> SocketAddrV4 {
+        SocketAddrV4::new(Ipv4Addr::new(205, 196, 6, 1), port)
+    }
+
+    #[test]
+    fn e2_layout_attributes_the_wrapped_sibling_and_places_the_relay() {
+        let mut r = Rig::new("e2");
+        let id = SteamId(1);
+        // Steam: "not relayed", remote = relay :4379 (sends + STUN replies).
+        r.traffic.insert(relay(4379), tr(2, 33, true));
+        // The other player's traffic, wrapped, from :4380 (not yet claimed).
+        r.side.traffic.insert(relay(4380), tr(18, 2, false));
+        r.step(&[(id, state(false, relay(4379)))], "F,P,A,L");
+
+        let v = &r.peers[&id];
+        assert_eq!(
+            v.evidence,
+            Evidence {
+                flag: false,
+                pattern: true,
+                asn: None,
+                list: true
+            }
+        );
+        assert!(v.evidence.relayed(&Detectors::ALL));
+        assert_eq!(v.relay_ip, Some(*relay(0).ip()));
+        assert_eq!(v.relay_eps, vec![relay(4380)]);
+        assert_eq!(r.by_endpoint.get(&relay(4380)), Some(&id));
+        let g = v.relay_geo.as_ref().unwrap();
+        assert_eq!(g.site.map(|p| p.code), Some("sea"));
+        assert!(g.distance_km.unwrap() > 50.0); // Victoria to Seattle site
+        assert_eq!(v.endpoints(), vec![relay(4379), relay(4380)]);
+        assert_eq!(
+            r.events("relay_attributed"),
+            vec![format!("1 {}", relay(4380))]
+        );
+        assert_eq!(
+            r.events("relay_evidence"),
+            vec![format!(
+                "1 F=0 P=1 A=? L=1 relayed=1 remote={}",
+                relay(4379)
+            )]
+        );
+        // A second identical poll logs nothing new.
+        r.step(&[(id, state(false, relay(4379)))], "F,P,A,L");
+        assert_eq!(r.events("relay_evidence").len(), 1);
+        assert_eq!(r.events("relay_attributed").len(), 1);
+    }
+
+    #[test]
+    fn pattern_alone_is_enough_when_it_is_the_only_detector() {
+        let mut r = Rig::new("ponly");
+        let id = SteamId(1);
+        r.traffic.insert(relay(4379), tr(2, 33, true));
+        r.side.traffic.insert(relay(4380), tr(18, 2, false));
+        r.step(&[(id, state(false, relay(4379)))], "P");
+        assert_eq!(r.peers[&id].relay_eps, vec![relay(4380)]);
+        // With only F deciding, the same evidence isn't a relay.
+        let mut r = Rig::new("fonly");
+        r.traffic.insert(relay(4379), tr(2, 33, true));
+        r.side.traffic.insert(relay(4380), tr(18, 2, false));
+        r.step(&[(id, state(false, relay(4379)))], "F");
+        assert!(r.peers[&id].relay_eps.is_empty());
+        assert!(r.peers[&id].relay_ip.is_none());
+    }
+
+    #[test]
+    fn two_peers_on_one_relay_ip_share_nothing() {
+        let mut r = Rig::new("two");
+        r.traffic.insert(relay(4379), tr(2, 33, true));
+        r.traffic.insert(relay(4381), tr(2, 33, true));
+        r.side.traffic.insert(relay(4380), tr(36, 4, false));
+        r.step(
+            &[
+                (SteamId(1), state(false, relay(4379))),
+                (SteamId(2), state(false, relay(4381))),
+            ],
+            "F,P,A,L",
+        );
+        for id in [SteamId(1), SteamId(2)] {
+            assert!(r.peers[&id].relay_eps.is_empty(), "{id}");
+            assert!(r.peers[&id].evidence.relayed(&Detectors::ALL));
+        }
+        assert!(!r.by_endpoint.contains_key(&relay(4380)));
+    }
+
+    #[test]
+    fn direct_lan_peer_is_not_a_relay() {
+        let mut r = Rig::new("lan");
+        let id = SteamId(1);
+        let peer = SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 15), 58864);
+        r.traffic.insert(peer, tr(19, 37, true));
+        r.step(&[(id, state(false, peer))], "F,P,A,L");
+        let v = &r.peers[&id];
+        assert_eq!(v.evidence, Evidence::default());
+        assert!(v.relay_ip.is_none() && v.relay_eps.is_empty() && v.relay_geo.is_none());
+    }
+
+    #[test]
+    fn e1_layout_finds_the_relay_from_traffic() {
+        let mut r = Rig::new("e1");
+        let id = SteamId(1);
+        // Steam: relayed, remote = the player's public IP (no packets go there).
+        let public = SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 20), 27015);
+        r.side.traffic.insert(relay(4380), tr(23, 43, true));
+        r.step(&[(id, state(true, public))], "F,P,A,L");
+        let v = &r.peers[&id];
+        assert_eq!(v.evidence.letters(), "F");
+        assert_eq!(v.relay_ip, Some(*relay(0).ip()));
+        assert_eq!(v.relay_eps, vec![relay(4380)]);
+        // The relay is placed; the player's address isn't touched here.
+        assert!(v.relay_geo.is_some());
+        // Peer leaves: attribution removed and logged.
+        r.step(&[], "F,P,A,L");
+        assert!(r.peers[&id].relay_eps.is_empty());
+        assert!(!r.by_endpoint.contains_key(&relay(4380)));
+        assert_eq!(
+            r.events("relay_unattributed"),
+            vec![format!("1 {}", relay(4380))]
+        );
     }
 }
 

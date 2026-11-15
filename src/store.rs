@@ -67,20 +67,40 @@ CREATE TABLE IF NOT EXISTS rtt (
     source TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS geo (
-    steam_id INTEGER PRIMARY KEY,
+    steam_id INTEGER NOT NULL,
     country TEXT,
     city TEXT,
     lat REAL,
     lon REAL,
     accuracy_km INTEGER,
     distance_km REAL,
-    fiber_bound_ms REAL
+    fiber_bound_ms REAL,
+    subject TEXT NOT NULL DEFAULT 'peer',
+    site TEXT,
+    PRIMARY KEY (steam_id, subject)
 );
 CREATE TABLE IF NOT EXISTS event (
     t_ns INTEGER NOT NULL,
     kind TEXT NOT NULL,
     detail TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS traffic (
+    t_ns INTEGER NOT NULL,
+    steam_id INTEGER,
+    remote_ip TEXT NOT NULL,
+    remote_port INTEGER NOT NULL,
+    role TEXT NOT NULL,
+    pps_in REAL NOT NULL,
+    pps_out REAL NOT NULL,
+    pkts_in INTEGER NOT NULL,
+    pkts_out INTEGER NOT NULL,
+    bytes_in INTEGER NOT NULL,
+    bytes_out INTEGER NOT NULL,
+    payload_in INTEGER,
+    payload_out INTEGER,
+    max_gap_in_ms REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS traffic_by_ep ON traffic (remote_ip, remote_port, t_ns);
 CREATE INDEX IF NOT EXISTS rtt_by_peer ON rtt (steam_id, t_ns);
 CREATE INDEX IF NOT EXISTS state_by_peer ON p2p_state (steam_id, t_ns);
 "#;
@@ -108,6 +128,45 @@ pub struct GeoRow<'a> {
     pub accuracy_km: Option<u16>,
     pub distance_km: Option<f64>,
     pub fiber_bound_ms: Option<f64>,
+    /// Steam relay site code (e.g. "sea"), for a relay's row.
+    pub site: Option<&'a str>,
+}
+
+/// Whose location a `geo` row describes. A relayed peer can have both: the
+/// player's (when Steam reveals their address) and the relay server's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GeoSubject {
+    Peer,
+    Relay,
+}
+
+impl GeoSubject {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GeoSubject::Peer => "peer",
+            GeoSubject::Relay => "relay",
+        }
+    }
+}
+
+/// One periodic traffic snapshot for one remote endpoint.
+pub struct TrafficRow {
+    pub t_ns: i128,
+    pub steam_id: Option<SteamId>,
+    pub remote: std::net::SocketAddrV4,
+    /// "peer", "relay_stun", "relay_wrapped" or "game" (unattributed).
+    pub role: &'static str,
+    pub pps_in: f64,
+    pub pps_out: f64,
+    /// Running totals since the endpoint was first seen.
+    pub pkts_in: u64,
+    pub pkts_out: u64,
+    pub bytes_in: u64,
+    pub bytes_out: u64,
+    /// Estimated game payload with relay headers removed (wrapped relay
+    /// endpoints only).
+    pub payload: Option<(u64, u64)>,
+    pub max_gap_in_ms: f64,
 }
 
 impl Store {
@@ -122,7 +181,15 @@ impl Store {
         }
         let conn = Connection::open(path)
             .with_context(|| format!("opening run database {}", path.display()))?;
+        let old_geo = rename_old_geo(&conn)?;
         conn.execute_batch(SCHEMA)?;
+        if old_geo {
+            conn.execute_batch(
+                "INSERT INTO geo (steam_id, country, city, lat, lon, accuracy_km, distance_km, fiber_bound_ms)
+                 SELECT steam_id, country, city, lat, lon, accuracy_km, distance_km, fiber_bound_ms FROM geo_v1;
+                 DROP TABLE geo_v1;",
+            )?;
+        }
         Ok(Self { conn })
     }
 
@@ -206,10 +273,12 @@ impl Store {
         Ok(())
     }
 
-    /// Store (or replace) a peer's location estimate.
-    pub fn upsert_geo(&self, id: SteamId, g: &GeoRow<'_>) -> Result<()> {
+    /// Store (or replace) a location estimate for a peer or its relay.
+    pub fn upsert_geo(&self, id: SteamId, subject: GeoSubject, g: &GeoRow<'_>) -> Result<()> {
         self.conn.execute(
-            "INSERT OR REPLACE INTO geo VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT OR REPLACE INTO geo (steam_id, country, city, lat, lon, accuracy_km,
+                 distance_km, fiber_bound_ms, subject, site)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 id.0 as i64,
                 g.country,
@@ -218,7 +287,49 @@ impl Store {
                 g.lon,
                 g.accuracy_km,
                 g.distance_km,
-                g.fiber_bound_ms
+                g.fiber_bound_ms,
+                subject.as_str(),
+                g.site,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Remove a location row (used when an address first taken for the
+    /// player turns out to be a relay).
+    pub fn delete_geo(&self, id: SteamId, subject: GeoSubject) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM geo WHERE steam_id = ?1 AND subject = ?2",
+            params![id.0 as i64, subject.as_str()],
+        )?;
+        Ok(())
+    }
+
+    /// The raw connection, so other modules' tests can check what was logged.
+    #[cfg(test)]
+    pub fn conn_for_tests(&self) -> &Connection {
+        &self.conn
+    }
+
+    /// Append one traffic snapshot.
+    pub fn insert_traffic(&self, r: &TrafficRow) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO traffic VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            params![
+                r.t_ns as i64,
+                r.steam_id.map(|i| i.0 as i64),
+                r.remote.ip().to_string(),
+                r.remote.port(),
+                r.role,
+                r.pps_in,
+                r.pps_out,
+                r.pkts_in as i64,
+                r.pkts_out as i64,
+                r.bytes_in as i64,
+                r.bytes_out as i64,
+                r.payload.map(|p| p.0 as i64),
+                r.payload.map(|p| p.1 as i64),
+                r.max_gap_in_ms,
             ],
         )?;
         Ok(())
@@ -233,8 +344,9 @@ impl Store {
         Ok(())
     }
 
-    /// Write anonymized CSVs (`rtt.csv`, `state.csv`, `peers.csv`) into `out_dir`.
-    // Export works the same way for all three files:
+    /// Write anonymized CSVs (`rtt.csv`, `state.csv`, `peers.csv`,
+    /// `traffic.csv`) into `out_dir`.
+    // Export works the same way for every file:
     //   1. create a CSV writer and write the header row;
     //   2. `prepare` a SELECT, then loop over the rows with `while let Some(r)`;
     //   3. replace identifiers (pseudonym, /24 network) before writing each row;
@@ -302,6 +414,8 @@ impl Store {
         w.flush()?;
 
         // Location is coarsened to country plus distance rounded to 50 km.
+        // The relay's site and country aren't personal (they're Valve's), so
+        // they're exported as-is next to the player's coarsened location.
         let mut w = csv::Writer::from_path(out_dir.join("peers.csv"))?;
         w.write_record([
             "run",
@@ -311,11 +425,15 @@ impl Store {
             "fiber_bound_ms",
             "first_seen_ns",
             "last_seen_ns",
+            "relay_site",
+            "relay_country",
         ])?;
         let mut q = self.conn.prepare(
             "SELECT p.steam_id, g.country, g.distance_km, g.fiber_bound_ms,
-                    p.first_seen_ns, p.last_seen_ns
-             FROM peer p LEFT JOIN geo g ON g.steam_id = p.steam_id",
+                    p.first_seen_ns, p.last_seen_ns, r.site, r.country
+             FROM peer p
+             LEFT JOIN geo g ON g.steam_id = p.steam_id AND g.subject = 'peer'
+             LEFT JOIN geo r ON r.steam_id = p.steam_id AND r.subject = 'relay'",
         )?;
         let mut rows = q.query([])?;
         while let Some(r) = rows.next()? {
@@ -323,6 +441,8 @@ impl Store {
             let country: Option<String> = r.get(1)?;
             let dist: Option<f64> = r.get(2)?;
             let bound: Option<f64> = r.get(3)?;
+            let site: Option<String> = r.get(6)?;
+            let rcountry: Option<String> = r.get(7)?;
             w.write_record([
                 run_label.to_string(),
                 anon::pseudonym(salt, sid as u64),
@@ -332,11 +452,76 @@ impl Store {
                 bound.map(|b| format!("{b:.2}")).unwrap_or_default(),
                 r.get::<_, i64>(4)?.to_string(),
                 r.get::<_, i64>(5)?.to_string(),
+                site.unwrap_or_default(),
+                rcountry.unwrap_or_default(),
+            ])?;
+        }
+        w.flush()?;
+
+        let mut w = csv::Writer::from_path(out_dir.join("traffic.csv"))?;
+        w.write_record([
+            "run",
+            "t_ns",
+            "peer",
+            "remote_net",
+            "role",
+            "pps_in",
+            "pps_out",
+            "pkts_in",
+            "pkts_out",
+            "bytes_in",
+            "bytes_out",
+            "payload_in",
+            "payload_out",
+            "max_gap_in_ms",
+        ])?;
+        let mut q = self.conn.prepare(
+            "SELECT t_ns, steam_id, remote_ip, role, pps_in, pps_out, pkts_in, pkts_out,
+                    bytes_in, bytes_out, payload_in, payload_out, max_gap_in_ms
+             FROM traffic ORDER BY t_ns",
+        )?;
+        let mut rows = q.query([])?;
+        while let Some(r) = rows.next()? {
+            let sid: Option<i64> = r.get(1)?;
+            let ip: String = r.get(2)?;
+            let opt_i = |v: Option<i64>| v.map(|x| x.to_string()).unwrap_or_default();
+            w.write_record([
+                run_label.to_string(),
+                r.get::<_, i64>(0)?.to_string(),
+                sid.map(|s| anon::pseudonym(salt, s as u64))
+                    .unwrap_or_default(),
+                net_of(&ip),
+                r.get::<_, String>(3)?,
+                format!("{:.2}", r.get::<_, f64>(4)?),
+                format!("{:.2}", r.get::<_, f64>(5)?),
+                r.get::<_, i64>(6)?.to_string(),
+                r.get::<_, i64>(7)?.to_string(),
+                r.get::<_, i64>(8)?.to_string(),
+                r.get::<_, i64>(9)?.to_string(),
+                opt_i(r.get(10)?),
+                opt_i(r.get(11)?),
+                format!("{:.1}", r.get::<_, f64>(12)?),
             ])?;
         }
         w.flush()?;
         Ok(())
     }
+}
+
+/// Run databases from before relay geo (tool 0.1.0 up to E2) have a `geo`
+/// table keyed by Steam ID alone. If this is one, rename it to `geo_v1` so
+/// the schema can create the new table; `open` then copies the old rows in
+/// as `subject = 'peer'`. Returns whether it renamed anything.
+fn rename_old_geo(conn: &Connection) -> Result<bool> {
+    let cols: Vec<String> = conn
+        .prepare("SELECT name FROM pragma_table_info('geo')")?
+        .query_map([], |r| r.get(0))?
+        .collect::<std::result::Result<_, _>>()?;
+    if cols.is_empty() || cols.iter().any(|c| c == "subject") {
+        return Ok(false);
+    }
+    conn.execute_batch("ALTER TABLE geo RENAME TO geo_v1;")?;
+    Ok(true)
 }
 
 /// Convert a stored IP string into its /24 network, or "?" if it doesn't parse.
@@ -390,9 +575,38 @@ mod tests {
             },
         )
         .unwrap();
+        let relay = SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 148), 4380);
+        s.insert_traffic(&TrafficRow {
+            t_ns: 4,
+            steam_id: Some(id),
+            remote: relay,
+            role: "relay_wrapped",
+            pps_in: 18.0,
+            pps_out: 2.0,
+            pkts_in: 10,
+            pkts_out: 2,
+            bytes_in: 1290,
+            bytes_out: 264,
+            payload: Some((850, 136)),
+            max_gap_in_ms: 120.0,
+        })
+        .unwrap();
+        let geo = |site| GeoRow {
+            country: Some("US"),
+            city: Some("Seattle"),
+            lat: Some(47.6),
+            lon: Some(-122.3),
+            accuracy_km: None,
+            distance_km: None,
+            fiber_bound_ms: None,
+            site,
+        };
+        s.upsert_geo(id, GeoSubject::Peer, &geo(None)).unwrap();
+        s.upsert_geo(id, GeoSubject::Relay, &geo(Some("sea")))
+            .unwrap();
         let out = dir.join("export");
         s.export_anonymized(&out, "salt", "r1").unwrap();
-        let all = ["rtt.csv", "state.csv", "peers.csv"]
+        let all = ["rtt.csv", "state.csv", "peers.csv", "traffic.csv"]
             .iter()
             .map(|f| std::fs::read_to_string(out.join(f)).unwrap())
             .collect::<String>();
@@ -401,6 +615,63 @@ mod tests {
         assert!(!all.contains("203.0.113.9"));
         assert!(!all.contains("76561198000000001"));
         assert!(!all.contains("Solaire"));
+        // Traffic rows: /24 only, with the payload estimate.
+        assert!(all.contains("198.51.100.0/24,relay_wrapped"));
+        assert!(!all.contains("198.51.100.148"));
+        assert!(all.contains(",850,136,"));
+        // Peer and relay rows both kept; one peers.csv line carries both.
+        let peers = std::fs::read_to_string(out.join("peers.csv")).unwrap();
+        assert_eq!(peers.lines().count(), 2);
+        assert!(peers.contains(",sea,US"));
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A run file from before relay geo opens, keeps its peer location, and
+    /// can then store a relay location as well.
+    #[test]
+    fn old_geo_table_is_migrated() {
+        let dir = std::env::temp_dir().join(format!("ds3sm-mig-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("old.sqlite");
+        {
+            let c = Connection::open(&db).unwrap();
+            c.execute_batch(
+                "CREATE TABLE geo (steam_id INTEGER PRIMARY KEY, country TEXT, city TEXT,
+                   lat REAL, lon REAL, accuracy_km INTEGER, distance_km REAL, fiber_bound_ms REAL);
+                 INSERT INTO geo VALUES (7, 'CA', 'X', 1.0, 2.0, 5, 10.0, 0.1);",
+            )
+            .unwrap();
+        }
+        let s = Store::open(&db).unwrap();
+        s.upsert_geo(
+            SteamId(7),
+            GeoSubject::Relay,
+            &GeoRow {
+                country: Some("US"),
+                city: None,
+                lat: None,
+                lon: None,
+                accuracy_km: None,
+                distance_km: None,
+                fiber_bound_ms: None,
+                site: Some("sea"),
+            },
+        )
+        .unwrap();
+        let rows: Vec<(String, String)> = s
+            .conn
+            .prepare("SELECT subject, country FROM geo ORDER BY subject")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![("peer".into(), "CA".into()), ("relay".into(), "US".into())]
+        );
         drop(s);
         let _ = std::fs::remove_dir_all(&dir);
     }
