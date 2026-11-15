@@ -141,6 +141,9 @@ pub struct RawTcp {
     pub dport: u16,
     pub sport: u16,
     pub size: u32,
+    /// Whether `daddr:dport` is the remote side (else `saddr:sport`),
+    /// decided in the callback from steam.exe's known local ports.
+    pub remote_is_d: bool,
 }
 
 /// A decoded TCP event: the remote side, as for UDP.
@@ -221,13 +224,10 @@ impl ByteOrder {
     /// Decode a TCP event with the byte order learned from the UDP probe
     /// (same kernel provider, same field encoding).
     pub fn decode_tcp(self, r: &RawTcp) -> TcpSegment {
-        let remote = match r.kind {
-            TcpKind::Send | TcpKind::Retransmit => {
-                SocketAddrV4::new(self.addr(r.daddr), self.port(r.dport))
-            }
-            TcpKind::Recv | TcpKind::Copy => {
-                SocketAddrV4::new(self.addr(r.saddr), self.port(r.sport))
-            }
+        let remote = if r.remote_is_d {
+            SocketAddrV4::new(self.addr(r.daddr), self.port(r.dport))
+        } else {
+            SocketAddrV4::new(self.addr(r.saddr), self.port(r.sport))
         };
         TcpSegment {
             t_ns: r.t_ns,
@@ -285,6 +285,9 @@ pub struct Diag {
     pub opcodes: [AtomicU64; 4],
     /// The first schema or field error, verbatim.
     pub first_err: Mutex<Option<String>>,
+    /// TCP only: raw fields of the first few inbound events dropped while
+    /// steam.exe's local ports were known, to show the kernel's layout.
+    pub dropped_samples: Mutex<Vec<String>>,
 }
 
 impl Diag {
@@ -317,7 +320,14 @@ impl Diag {
             self.self_pid.load(Ordering::Relaxed),
             ops.join(","),
             first
-        )
+        ) + &self.samples_suffix()
+    }
+
+    fn samples_suffix(&self) -> String {
+        match self.dropped_samples.lock() {
+            Ok(v) if !v.is_empty() => format!(" dropped_inbound=[{}]", v.join("; ")),
+            _ => String::new(),
+        }
     }
 }
 
@@ -446,9 +456,21 @@ fn parse_tcp_event(
     let pid: u32 = field!("PID");
     let sport: u16 = field!("sport");
     let dport: u16 = field!("dport");
-    if !keep_tcp(kind, pid == steam_pid, sport, dport, ports) {
+    let Some(remote_is_d) = keep_tcp(kind, pid == steam_pid, sport, dport, ports) else {
+        let inbound = matches!(kind, TcpKind::Recv | TcpKind::Copy);
+        if inbound
+            && !ports.is_empty()
+            && let Ok(mut v) = diag.dropped_samples.lock()
+            && v.len() < 10
+        {
+            let known: Vec<String> = ports.iter().map(|p| format!("{p:#06x}")).collect();
+            v.push(format!(
+                "op={op} pid={pid} sport={sport:#06x} dport={dport:#06x} known=[{}]",
+                known.join(",")
+            ));
+        }
         return None;
-    }
+    };
     let ft = record.raw_timestamp();
     Some(RawTcp {
         t_ns: (ft - FILETIME_UNIX_EPOCH) as i128 * 100,
@@ -459,30 +481,47 @@ fn parse_tcp_event(
         dport,
         sport,
         size: field!("size"),
+        remote_is_d,
     })
 }
 
-/// The TCP keep rule (see [`parse_tcp_event`]): outbound events need
-/// steam.exe's PID and teach their local port (`sport`); inbound events
-/// need that local port (their `dport`) or the PID.
+/// The TCP keep rule (see [`parse_tcp_event`]). Returns `None` to drop the
+/// event, else whether `daddr:dport` is the remote side.
+///
+/// Outbound events need steam.exe's PID; their `sport` is the local port,
+/// which is learned. Inbound events are kept when either port is a learned
+/// local port, and the *other* side is the remote. E3-T2 showed why both:
+/// receives were never kept when only `dport` was checked, which means the
+/// kernel's TCP events name the local side `saddr:sport` in both
+/// directions (unlike its UDP events, where "source" follows the packet).
+/// Checking both sides stays correct either way.
 fn keep_tcp(
     kind: TcpKind,
     is_steam: bool,
     sport: u16,
     dport: u16,
     ports: &mut HashSet<u16>,
-) -> bool {
+) -> Option<bool> {
     match kind {
         TcpKind::Send | TcpKind::Retransmit => {
-            if is_steam {
-                if ports.len() >= MAX_STEAM_TCP_PORTS && !ports.contains(&sport) {
-                    ports.clear();
-                }
-                ports.insert(sport);
+            if !is_steam {
+                return None;
             }
-            is_steam
+            if ports.len() >= MAX_STEAM_TCP_PORTS && !ports.contains(&sport) {
+                ports.clear();
+            }
+            ports.insert(sport);
+            Some(true)
         }
-        TcpKind::Recv | TcpKind::Copy => is_steam || ports.contains(&dport),
+        TcpKind::Recv | TcpKind::Copy => {
+            if ports.contains(&sport) {
+                Some(true)
+            } else if ports.contains(&dport) || is_steam {
+                Some(false)
+            } else {
+                None
+            }
+        }
     }
 }
 
@@ -683,14 +722,33 @@ mod tests {
     fn tcp_receives_are_kept_by_steams_local_port() {
         let mut ports = HashSet::new();
         // Before any send, a receive on the port isn't known yet.
-        assert!(!keep_tcp(TcpKind::Recv, false, 49202, 53795, &mut ports));
+        assert_eq!(
+            keep_tcp(TcpKind::Recv, false, 53795, 49202, &mut ports),
+            None
+        );
         // A steam.exe send from local port 53795 teaches the port.
-        assert!(keep_tcp(TcpKind::Send, true, 53795, 49202, &mut ports));
-        assert!(keep_tcp(TcpKind::Recv, false, 49202, 53795, &mut ports));
-        assert!(keep_tcp(TcpKind::Copy, false, 49202, 53795, &mut ports));
+        assert_eq!(
+            keep_tcp(TcpKind::Send, true, 53795, 49202, &mut ports),
+            Some(true)
+        );
+        // Kernel TCP layout (E3-T2): local side in saddr:sport, so the
+        // remote is daddr:dport.
+        assert_eq!(
+            keep_tcp(TcpKind::Recv, false, 53795, 49202, &mut ports),
+            Some(true)
+        );
+        assert_eq!(
+            keep_tcp(TcpKind::Copy, false, 53795, 49202, &mut ports),
+            Some(true)
+        );
+        // UDP-style layout (source = sender) would also be handled.
+        assert_eq!(
+            keep_tcp(TcpKind::Recv, false, 49202, 53795, &mut ports),
+            Some(false)
+        );
         // Another process: its sends are dropped and teach nothing.
-        assert!(!keep_tcp(TcpKind::Send, false, 60000, 443, &mut ports));
-        assert!(!keep_tcp(TcpKind::Recv, false, 443, 60000, &mut ports));
+        assert_eq!(keep_tcp(TcpKind::Send, false, 60000, 443, &mut ports), None);
+        assert_eq!(keep_tcp(TcpKind::Recv, false, 443, 60000, &mut ports), None);
         // The set stays bounded.
         for p in 0..200u16 {
             keep_tcp(TcpKind::Send, true, 1000 + p, 80, &mut ports);
@@ -708,10 +766,11 @@ mod tests {
         let peer = u32::from(Ipv4Addr::new(192, 0, 2, 15)).swap_bytes();
         let me = u32::from(Ipv4Addr::new(192, 0, 2, 9)).swap_bytes();
         let want = SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 15), 49202);
-        for (kind, daddr, saddr, dport, sport) in [
-            (TcpKind::Send, peer, me, 49202u16, 53795u16),
-            (TcpKind::Retransmit, peer, me, 49202, 53795),
-            (TcpKind::Recv, me, peer, 53795, 49202),
+        for (kind, daddr, saddr, dport, sport, remote_is_d) in [
+            (TcpKind::Send, peer, me, 49202u16, 53795u16, true),
+            (TcpKind::Retransmit, peer, me, 49202, 53795, true),
+            (TcpKind::Recv, peer, me, 49202, 53795, true),
+            (TcpKind::Recv, me, peer, 53795, 49202, false),
         ] {
             let r = RawTcp {
                 t_ns: 1,
@@ -722,6 +781,7 @@ mod tests {
                 dport: dport.swap_bytes(),
                 sport: sport.swap_bytes(),
                 size: 87,
+                remote_is_d,
             };
             let s = bo.decode_tcp(&r);
             assert_eq!(s.remote, want, "{kind:?}");
