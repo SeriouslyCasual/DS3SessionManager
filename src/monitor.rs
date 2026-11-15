@@ -368,7 +368,7 @@ struct PeerView {
     /// Whether `path_unseen` is the last logged path event.
     unseen_logged: bool,
     /// Whether the peer is currently measured from Steam's TCP fallback
-    /// (`--tcp`).
+    /// (on unless `--no-tcp`).
     on_tcp: bool,
     /// RTT on the TCP fallback, from Windows' TCP statistics (`estats.rs`),
     /// kept apart from the UDP `rtt`.
@@ -586,7 +586,7 @@ pub fn run(args: MonitorArgs) -> Result<()> {
     let (trace, byte_order) = if args.no_etw {
         (None, None)
     } else {
-        let t = etw::start_with(args.tcp)?;
+        let t = etw::start_with(!args.no_tcp)?;
         let (bo, _) = etw::calibrate(&t)?;
         store.event(now_ns(), "etw_byte_order", &format!("{bo:?}"))?;
         t.game_pid.store(game_pid, Ordering::Relaxed);
@@ -617,10 +617,10 @@ pub fn run(args: MonitorArgs) -> Result<()> {
     let mut next_poll = Instant::now();
     let mut last_pid_check = Instant::now();
     let mut last_traffic_log = Instant::now();
-    // TCP fallback state, only with `--tcp` and ETW on. Separate from every
+    // TCP fallback state, on by default (off with `--no-tcp`), ETW needed. Separate from every
     // UDP structure above (`tcp.rs`).
     let mut tcp_paths =
-        (args.tcp && trace.is_some()).then(|| TcpPaths::new(args.req_size, args.reply_size));
+        (!args.no_tcp && trace.is_some()).then(|| TcpPaths::new(args.req_size, args.reply_size));
     if tcp_paths.is_some() {
         store.set_meta("tcp_fallback", "on")?;
     }
@@ -647,7 +647,7 @@ pub fn run(args: MonitorArgs) -> Result<()> {
                 &store,
             )?;
         }
-        // 1b. Drain TCP fallback events (`--tcp`).
+        // 1b. Drain TCP fallback events (on unless `--no-tcp`).
         if let (Some(t), Some(bo), Some(tp)) = (&trace, byte_order, tcp_paths.as_mut()) {
             drain_tcp(t, bo, steam_pid, tp, &by_endpoint, &store)?;
             // Read the fallback connections' TCP statistics every pass
@@ -793,7 +793,7 @@ pub fn run(args: MonitorArgs) -> Result<()> {
             // Relayed by Steam's flag with no relay endpoint found yet is its
             // own case ("yes" in the table), not an unseen path.
             let relay_unfound = view.evidence.relayed(&ctx.detectors) && view.relay_eps.is_empty();
-            // TCP fallback (`--tcp` only): no UDP from the player, but TCP
+            // TCP fallback (unless `--no-tcp`): no UDP from the player, but TCP
             // data arriving on Steam's reported endpoint. Then the row is
             // measured from TCP, so it isn't an unseen path.
             let on_tcp = tcp_paths.as_ref().is_some_and(|tp| {
@@ -1282,7 +1282,7 @@ fn drain_etw(
 }
 
 /// Move TCP events from the ETW thread into the TCP fallback state
-/// (`--tcp`). Only steam.exe segments to an endpoint Steam reports for a
+/// (on unless `--no-tcp`). Only steam.exe segments to an endpoint Steam reports for a
 /// peer count; Steam's own server connection and everything else is
 /// ignored. No RTT is taken from TCP (send events are stamped at
 /// acknowledgement; see `tcp.rs`), so nothing reaches the RTT table.
@@ -1508,7 +1508,7 @@ fn draw(
     ));
     for id in current {
         let Some(v) = peers.get(id) else { continue };
-        // On Steam's TCP fallback (`--tcp`), the row is measured from TCP:
+        // On Steam's TCP fallback (on unless `--no-tcp`), the row is measured from TCP:
         // jitter from the framed stream, the loss column shows outbound
         // resends, and RTT comes from Windows' TCP statistics (whole ms).
         // Otherwise UDP, as always.
@@ -1643,8 +1643,8 @@ fn draw(
         let secs = v.unseen_since.map_or(0, |s| (t_now - s) / 1_000_000_000);
         out.push_str(&format!(
             "A! {name}: Steam says the session is active, but no UDP has arrived from them for {secs} s. \
-             The traffic has probably moved to Steam's TCP fallback (start with --tcp to follow it); \
-             RTT, jit and nrep% are stale.\n"
+             The traffic has probably moved somewhere ds3sm can't see (Steam's TCP fallback is followed \
+             unless --no-tcp is set); RTT, jit and nrep% are stale.\n"
         ));
     }
     if shown.iter().any(|(_, v)| v.on_tcp) {

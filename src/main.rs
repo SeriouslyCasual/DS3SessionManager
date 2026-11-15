@@ -123,11 +123,11 @@ pub struct MonitorArgs {
     // A `bool` flag is `false` unless the user passes `--no-etw`.
     #[arg(long)]
     pub no_etw: bool,
-    /// Also follow Steam's TCP fallback (experimental): when Steam moves a
-    /// session off UDP to a direct TCP connection, keep reporting RTT,
-    /// jitter and resends from it, marked `tcp`. Off by default.
+    /// Don't follow Steam's TCP fallback. By default, when Steam moves a
+    /// session off UDP to a direct TCP connection, ds3sm keeps reporting
+    /// RTT, jitter and resends from it, marked `tcp` (validated in E3-T5).
     #[arg(long)]
-    pub tcp: bool,
+    pub no_tcp: bool,
     /// Free-text label stored with the run (e.g. what you were testing).
     #[arg(long, default_value = "")]
     pub label: String,

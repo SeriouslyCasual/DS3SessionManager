@@ -25,8 +25,8 @@
 //! | `geo`       | peer's estimated location                      |
 //! | `event`     | notable happening (game restarted, peer left)  |
 //! | `traffic`   | endpoint every 5 s (rates, gaps, jitter)       |
-//! | `tcp_seg`   | steam.exe TCP segment to a peer (`--tcp` only) |
-//! | `tcp_estats`| TCP fallback connection stats per poll (`--tcp`)|
+//! | `tcp_seg`   | steam.exe TCP segment to a peer (TCP fallback) |
+//! | `tcp_estats`| TCP fallback connection stats per poll (TCP fallback)|
 
 use crate::anon;
 use crate::model::{P2PState, RttSample, SteamId};
@@ -304,7 +304,7 @@ impl Store {
 
     /// Append one RTT sample. `id` is `Option` because ETW can time a packet to an
     /// endpoint that Steam hasn't (yet) reported as belonging to a peer.
-    /// Log one steam.exe TCP event to a peer endpoint (`monitor --tcp`
+    /// Log one steam.exe TCP event to a peer endpoint (TCP fallback
     /// only): kind is "send", "recv", "copy" or "retx", plus a send event's
     /// raw `startime`/`endtime` fields. Lets a capture check the kernel's
     /// event granularity and timing event by event.
@@ -333,7 +333,7 @@ impl Store {
     }
 
     /// One reading of Windows' TCP statistics for a fallback connection
-    /// (`monitor --tcp`), in milliseconds and running counters, as read.
+    /// (TCP fallback), in milliseconds and running counters, as read.
     #[cfg(windows)]
     pub fn insert_tcp_estats(
         &self,
@@ -669,7 +669,7 @@ fn rename_old_geo(conn: &Connection) -> Result<bool> {
 
 /// Run databases from before stream jitter (or the STUN counters) have a
 /// `traffic` table without those columns; add them (NULL for old rows).
-/// `tcp_seg` gained the send-timing columns after the first `--tcp` runs.
+/// `tcp_seg` gained the send-timing columns after the first TCP-fallback runs.
 fn add_tcp_seg_columns(conn: &Connection) -> Result<()> {
     let cols: Vec<String> = conn
         .prepare("SELECT name FROM pragma_table_info('tcp_seg')")?
@@ -871,7 +871,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A run file from the first `--tcp` builds gains the send-timing
+    /// A run file from the first TCP-fallback builds gains the send-timing
     /// columns and accepts rows with and without them.
     #[test]
     fn old_tcp_seg_table_gains_send_times() {

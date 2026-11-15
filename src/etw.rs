@@ -85,7 +85,7 @@ static UDP_IP_PROVIDER: KernelProvider = KernelProvider::new(
 /// The kernel's TCP event class (`TcpIp`), enabled by the **same** flag as
 /// `UdpIp`, so the kernel already produces these events for the UDP trace;
 /// they are only *read* when a callback is registered under this GUID, which
-/// [`start_with`] does only when asked (`monitor --tcp`). Used to follow
+/// [`start_with`] does unless `monitor --no-tcp` is given. Used to follow
 /// Steam's TCP fallback (E3 C2): with every UDP path impaired, Steam carries
 /// the same P2P datagrams over a direct TCP connection to the peer, each with
 /// a 2-byte length prefix (see `tcp.rs`).
