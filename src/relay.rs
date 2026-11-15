@@ -453,6 +453,7 @@ mod tests {
             ep(148, 4380),
             ep(9, 4380),
             ep(148, 27015),
+            ep(148, STUN_SERVER_PORT),
         ];
         let claimed: HashSet<_> = [ep(148, 27015)].into();
         assert_eq!(
