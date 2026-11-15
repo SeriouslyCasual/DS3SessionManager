@@ -381,7 +381,10 @@ struct PeerView {
 struct TcpConn {
     remote: SocketAddrV4,
     row: windows::Win32::NetworkManagement::IpHelper::MIB_TCPROW_LH,
-    last: Option<estats::PathStats>,
+    /// Latest reading (logged every poll) and the rolling minimum, fed by
+    /// the frequent reads in the main loop.
+    latest: Option<estats::PathStats>,
+    min: estats::MinRtt,
 }
 
 /// How long an active session must stay silent on UDP, beyond the 5 s rate
@@ -647,6 +650,15 @@ pub fn run(args: MonitorArgs) -> Result<()> {
         // 1b. Drain TCP fallback events (`--tcp`).
         if let (Some(t), Some(bo), Some(tp)) = (&trace, byte_order, tcp_paths.as_mut()) {
             drain_tcp(t, bo, steam_pid, tp, &by_endpoint, &store)?;
+            // Read the fallback connections' TCP statistics every pass
+            // (~10 ms) so individual RTT samples are seen (`estats.rs`).
+            let now = now_ns();
+            for c in peers.values_mut().filter_map(|v| v.tcp_conn.as_mut()) {
+                if let Ok(s) = estats::read(&c.row) {
+                    c.min.update(s, now);
+                    c.latest = Some(s);
+                }
+            }
         }
 
         if Instant::now() < next_poll {
@@ -1310,10 +1322,10 @@ fn drain_tcp(
 }
 
 /// RTT on the TCP fallback from Windows' TCP statistics: find Steam's
-/// connection to `remote` once (and switch its statistics on), then read
-/// them every poll. Each reading is logged in `tcp_estats`; when TCP took
-/// new RTT samples since the last reading, their mean is stored as a
-/// `tcp_estats` RTT sample and added to the peer's `tcp_rtt`.
+/// connection to `remote` once (and switch its statistics on). The main
+/// loop reads it every ~10 ms into a rolling minimum; here, every poll, the
+/// latest reading is logged in `tcp_estats` and the 10 s minimum is stored
+/// as a `tcp_estats` RTT sample and added to the peer's `tcp_rtt`.
 fn tcp_rtt_step(
     view: &mut PeerView,
     id: SteamId,
@@ -1337,7 +1349,8 @@ fn tcp_rtt_step(
         view.tcp_conn = Some(TcpConn {
             remote,
             row,
-            last: None,
+            latest: None,
+            min: estats::MinRtt::default(),
         });
     }
     let Some(conn) = view.tcp_conn.as_mut() else {
@@ -1345,17 +1358,18 @@ fn tcp_rtt_step(
     };
     match estats::read(&conn.row) {
         Ok(s) => {
+            conn.min.update(s, t);
+            conn.latest = Some(s);
             store.insert_tcp_estats(t, remote, &s)?;
-            if let Some(mean) = conn.last.and_then(|p| s.interval_mean(&p)) {
+            if let Some(min) = conn.min.min() {
                 let sample = RttSample {
                     t_ns: t,
-                    rtt_ms: mean,
+                    rtt_ms: min,
                     source: RttSource::TcpEstats,
                 };
                 store.insert_rtt(Some(id), remote, &sample)?;
-                view.tcp_rtt.push(mean);
+                view.tcp_rtt.push(min);
             }
-            conn.last = Some(s);
         }
         Err(e) => {
             // The connection closed or changed: look it up again next poll.

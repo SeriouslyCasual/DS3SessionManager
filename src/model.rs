@@ -118,9 +118,10 @@ pub struct P2PState {
 pub enum RttSource {
     /// Kernel ETW UDP send/receive timing of STUN-sized packets.
     EtwStun,
-    /// On Steam's TCP fallback: Windows' own TCP RTT for the connection
-    /// (TCP ESTATS, `estats.rs`), the mean of the samples TCP took since
-    /// the previous reading. Whole ms; a different method from the checks.
+    /// On Steam's TCP fallback: Windows' own TCP RTT samples for the
+    /// connection (TCP ESTATS, `estats.rs`), their 10 s rolling minimum,
+    /// which filters out delayed ACKs. Whole ms; a different method from
+    /// the checks.
     #[cfg_attr(not(windows), allow(dead_code))]
     TcpEstats,
 }

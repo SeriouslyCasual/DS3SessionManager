@@ -16,10 +16,18 @@
 //!
 //! What it means: TCP's RTT, in **whole milliseconds**, measured from a
 //! segment's departure to its ACK. When the peer delays its ACKs, samples
-//! include that delay, so the interval mean can read above the network
-//! RTT; the minimum and the smoothed value are less affected. It is a
-//! different measurement from the UDP checks, labelled as such
-//! (`tcp_estats`).
+//! include that delay: in E3-T4 on the LAN (true RTT 0.23 ms) the samples
+//! ran 0–65 ms and their mean and the smoothed RTT sat near 30 ms. Samples
+//! whose ACK came straight back (e.g. on the peer's immediate reply to a
+//! check) are close to the true RTT, so the **minimum over a short window**
+//! filters the delayed-ACK inflation out. [`MinRtt`] keeps the individual
+//! samples, read often enough (every ~10 ms, about 30 samples/s on the
+//! fallback) that most reads see one new sample, and reports their 10 s
+//! minimum. It is a different measurement from the UDP checks, labelled as
+//! such (`tcp_estats`).
+//!
+//! (The send events' `startime`/`endtime` fields were checked too: they
+//! count 10 ms ticks, too coarse for RTT.)
 //!
 //! Switching collection on only affects the one connection (Steam's link
 //! to the peer) and ends with it.
@@ -29,6 +37,7 @@
 //! Thin `unsafe` wrappers around three Win32 calls. The structs are plain
 //! C data, so they're passed as byte slices of their own size.
 
+use std::collections::VecDeque;
 use std::net::{Ipv4Addr, SocketAddrV4};
 
 use windows::Win32::NetworkManagement::IpHelper::{
@@ -59,6 +68,41 @@ impl PathStats {
         let n = self.count_rtt.wrapping_sub(prev.count_rtt);
         (n > 0 && n < u32::MAX / 2)
             .then(|| self.sum_rtt.wrapping_sub(prev.sum_rtt) as f64 / n as f64)
+    }
+}
+
+/// Window over which the TCP RTT minimum is taken.
+pub const MIN_RTT_WINDOW_NS: i128 = 10_000_000_000;
+
+/// Rolling minimum of a connection's TCP RTT samples (see the module
+/// docs). Fed successive [`PathStats`] readings; a reading that adds one
+/// sample gives it exactly (ΔSumRtt), one that adds several gives their
+/// mean, which is never below their minimum, so the window minimum stays
+/// an upper bound on the best sample seen.
+#[derive(Default, Debug)]
+pub struct MinRtt {
+    last: Option<PathStats>,
+    samples: VecDeque<(i128, f64)>,
+}
+
+impl MinRtt {
+    pub fn update(&mut self, s: PathStats, t_ns: i128) {
+        if let Some(v) = self.last.and_then(|p| s.interval_mean(&p)) {
+            self.samples.push_back((t_ns, v));
+        }
+        self.last = Some(s);
+        while self
+            .samples
+            .front()
+            .is_some_and(|&(t0, _)| t_ns - t0 > MIN_RTT_WINDOW_NS)
+        {
+            self.samples.pop_front();
+        }
+    }
+
+    /// The minimum sample in the window, ms, or `None` if there is none.
+    pub fn min(&self) -> Option<f64> {
+        self.samples.iter().map(|&(_, v)| v).reduce(f64::min)
     }
 }
 
@@ -202,6 +246,37 @@ mod tests {
         };
         assert_eq!(b.interval_mean(&a), Some(20.0));
         assert_eq!(a.interval_mean(&a), None);
+    }
+
+    /// Delayed-ACK samples (tens of ms) don't hide the quick ones; old
+    /// samples leave the window.
+    #[test]
+    fn min_rtt_keeps_the_quick_samples_over_the_window() {
+        let s = 1_000_000_000i128;
+        let mut m = MinRtt::default();
+        let (mut sum, mut count) = (0u32, 0u32);
+        let mut feed = |m: &mut MinRtt, rtt: u32, t: i128| {
+            sum += rtt;
+            count += 1;
+            m.update(
+                PathStats {
+                    sum_rtt: sum,
+                    count_rtt: count,
+                    ..Default::default()
+                },
+                t,
+            );
+        };
+        feed(&mut m, 40, 0);
+        assert_eq!(m.min(), None); // first reading only sets the baseline
+        for (i, rtt) in [45, 52, 21, 38, 47].into_iter().enumerate() {
+            feed(&mut m, rtt, (i as i128 + 1) * s / 10);
+        }
+        assert_eq!(m.min(), Some(21.0));
+        // 12 s later, only newer samples count.
+        feed(&mut m, 30, 12 * s);
+        feed(&mut m, 33, 12 * s + s / 10);
+        assert_eq!(m.min(), Some(30.0));
     }
 
     /// The table call works without admin rights and returns rows with
