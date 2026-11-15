@@ -32,6 +32,11 @@ What it reports:
 6. For relayed runs, the other ports on the relay's IP: relay-wrapped
    packets are unwrapped and profiled by their inner size, and the local
    turnaround for the other player's relayed checks is measured.
+7. Stream jitter: ds3sm's RFC 3550 estimator (src/jitter.rs) replayed on
+   the capture for each peer or relay endpoint and direction, on the
+   dominant packet size, and compared with the `jit_in_ms` / `jit_out_ms`
+   values in the run's `traffic` table (runs from before stream jitter
+   have none).
 
 The endpoint comes from the run database: of the endpoints Steam reported
 and those ds3sm attributed to a relay, the one with the most RTT samples.
@@ -970,6 +975,20 @@ def print_report(r: dict, baseline: dict | None) -> None:
                 p(f"    inner sizes {x['inner_sizes']}")
         if sib["relayed_check_turnaround_ms"]:
             p(_line("local turnaround for relayed checks", sib["relayed_check_turnaround_ms"], "ms", 4))
+    if r.get("jitter"):
+        p("\nStream jitter (RFC 3550 on the dominant size, D = IAT - k*T; capture estimator):")
+        for x in r["jitter"]:
+            s = x["jitter_ms"]
+            p(f"  {x['endpoint']:<21} {x['dir']:<4} {x['pps']:6.2f} pps, stream {x['size']} B at "
+              f"{x['stream_pps']:5.2f}/s, period {_f(x['period_ms'], 2)} ms; "
+              + (f"J median {_f(s['median'])}  p95 {_f(s['p95'])}  max {_f(s['max'])} ms" if s else "J -"))
+            e = x.get("etw")
+            if e:
+                p(f"    vs ds3sm traffic rows (n={e['rows']}): ETW median {_f(e['etw_ms']['median'])}, "
+                  f"capture median {_f(e['capture_ms']['median'])} ms")
+                p("  " + _line("J diff ETW - capture (matched packet)", e["diff_ms"], "ms", 5))
+                p("  " + _line("implied ETW delivery lag", e["implied_lag_ms"], "ms", 0))
+                p("  " + _line("J diff at row time (unmatched)", e["at_row_time_diff_ms"], "ms", 4))
     if baseline and baseline.get("profile"):
         p("\nChange against baseline (pps, this minus baseline):")
         for d in (SEND, RECV):
@@ -983,6 +1002,187 @@ def print_report(r: dict, baseline: dict | None) -> None:
                 rows.append((abs(da - db), k, da, db))
             for _, k, da, db in sorted(rows, reverse=True)[:10]:
                 p(f"    {k:>5} B  {db:6.2f} -> {da:6.2f}  ({da - db:+.2f})")
+
+
+# ---------------------------------------------------------------------------
+# Stream jitter (mirror of src/jitter.rs)
+# ---------------------------------------------------------------------------
+
+JIT_GAIN = 16.0
+JIT_PERIOD_WINDOW = 64
+JIT_MIN_PERIOD_SAMPLES = 8
+# traffic rows this soon after an endpoint's first row are skipped in the
+# comparison: both estimators need time to forget their different starts.
+JIT_SETTLE_NS = 30_000_000_000
+# How far before a traffic row its jitter value can come from (ETW delivery lag).
+JIT_MATCH_WINDOW_NS = 3_000_000_000
+
+
+class StreamJitter:
+    """RFC 3550 jitter on the dominant packet size, D = IAT - k*T.
+
+    Same rules as ds3sm: T is the median of the last 64 inter-arrival times
+    (at least 8), k = round(IAT / T) (half away from zero, as Rust rounds),
+    J += (|D| - J) / 16, and a new dominant size restarts the estimate.
+    """
+
+    def __init__(self) -> None:
+        self.counts: Counter[int] = Counter()
+        self.size: int | None = None
+        self.last_ns: int | None = None
+        self.iats: list[float] = []
+        self.jitter_ms = 0.0
+        self.samples = 0
+
+    def period_ms(self) -> float | None:
+        if len(self.iats) < JIT_MIN_PERIOD_SAMPLES:
+            return None
+        return pct(self.iats, 0.5)
+
+    def value(self) -> float | None:
+        return self.jitter_ms if self.samples else None
+
+    def observe(self, size: int, t_ns: int) -> None:
+        self.counts[size] += 1
+        if self.size != size:
+            if self.size is not None and self.counts[size] <= self.counts[self.size]:
+                return
+            self.size, self.last_ns, self.iats = size, None, []
+            self.jitter_ms, self.samples = 0.0, 0
+        if self.last_ns is None:
+            self.last_ns = t_ns
+            return
+        if t_ns <= self.last_ns:
+            return
+        iat = (t_ns - self.last_ns) / 1e6
+        self.last_ns = t_ns
+        t = self.period_ms()
+        if t is not None:
+            k = float(int(iat / t + 0.5))
+            self.jitter_ms += (abs(iat - k * t) - self.jitter_ms) / JIT_GAIN
+            self.samples += 1
+        self.iats.append(iat)
+        if len(self.iats) > JIT_PERIOD_WINDOW:
+            del self.iats[0]
+
+
+def jitter_track(pkts: list[tuple[int, int]]) -> tuple[StreamJitter, list[tuple[int, float]]]:
+    """Run the estimator over (t_ns, size) packets; return it and J after each packet."""
+    j = StreamJitter()
+    track = []
+    for t_ns, size in pkts:
+        j.observe(size, t_ns)
+        v = j.value()
+        if v is not None and j.last_ns == t_ns:
+            track.append((t_ns, v))
+    return j, track
+
+
+def jitter_endpoints(udps: list[Udp], endpoint: tuple[str, int], db: sqlite3.Connection | None) -> list[tuple[str, int]]:
+    """The endpoint, the other ports on its IP, and every relay endpoint ds3sm attributed."""
+    eps = {endpoint}
+    for u in udps:
+        for ep in (u.src, u.dst):
+            if ep[0] == endpoint[0]:
+                eps.add(ep)
+    if db is not None:
+        for (d,) in db.execute("SELECT detail FROM event WHERE kind = 'relay_attributed'"):
+            parts = d.split()
+            if len(parts) >= 2:
+                eps.add(parse_endpoint(parts[1]))
+    return sorted(eps)
+
+
+def etw_jitter_rows(db: sqlite3.Connection, ep: tuple[str, int], col: str) -> list[tuple[int, float]]:
+    cols = {r[1] for r in db.execute("PRAGMA table_info(traffic)")}
+    if col not in cols:
+        return []
+    return [
+        (t, v)
+        for t, v in db.execute(
+            f"SELECT t_ns, {col} FROM traffic WHERE remote_ip = ? AND remote_port = ? AND {col} IS NOT NULL ORDER BY t_ns",
+            (ep[0], ep[1]),
+        )
+    ]
+
+
+def compare_jitter(
+    track: list[tuple[int, float]],
+    rows: list[tuple[int, float]],
+    offset_ns: int = 0,
+    window_ns: int = JIT_MATCH_WINDOW_NS,
+) -> dict | None:
+    """Match each ETW jitter value in the traffic log to the capture estimator.
+
+    A row is stamped when it is written, but ETW delivers packets in batches
+    up to about a second late, so the row holds J as of some packet in the
+    last second or so, not as of the row's time. Each row is therefore matched
+    to the capture value, after any packet in `window_ns` before the row,
+    closest to it. If the two estimators saw the same packets with the same
+    timestamps, the difference is ~0 and the implied delivery lag
+    (row time - packet time) is a fraction of a second. The capture's value
+    at the row's time is reported too (`at_row_time_diff_ms`).
+    """
+    if not track or not rows:
+        return None
+    times = [t for t, _ in track]
+    start = max(rows[0][0], times[0] + offset_ns) + JIT_SETTLE_NS
+    diffs, lags, at_row, etw_v, cap_v = [], [], [], [], []
+    for t, v in rows:
+        tc = t - offset_ns
+        if t < start or tc > times[-1] + window_ns:
+            continue
+        hi = bisect.bisect_right(times, tc)
+        lo = bisect.bisect_left(times, tc - window_ns)
+        if hi <= lo:
+            continue
+        i = min(range(lo, hi), key=lambda k: abs(v - track[k][1]))
+        diffs.append(v - track[i][1])
+        lags.append((tc - times[i]) / 1e6)
+        at_row.append(v - track[hi - 1][1])
+        etw_v.append(v)
+        cap_v.append(track[i][1])
+    if not diffs:
+        return None
+    return {
+        "rows": len(diffs),
+        "diff_ms": summarize(diffs),
+        "abs_diff_ms": summarize([abs(x) for x in diffs]),
+        "implied_lag_ms": summarize(lags),
+        "at_row_time_diff_ms": summarize(at_row),
+        "etw_ms": summarize(etw_v),
+        "capture_ms": summarize(cap_v),
+    }
+
+
+def jitter_report(udps: list[Udp], endpoint: tuple[str, int], db: sqlite3.Connection | None, offset_ns: int = 0) -> list[dict]:
+    """Per endpoint and direction: dominant size, period, J over the capture, and the ETW comparison."""
+    out = []
+    for ep in jitter_endpoints(udps, endpoint, db):
+        pk: dict[str, list[tuple[int, int]]] = {SEND: [], RECV: []}
+        for u in udps:
+            if u.dst == ep:
+                pk[SEND].append((u.t_ns, u.size))
+            elif u.src == ep:
+                pk[RECV].append((u.t_ns, u.size))
+        for direction, col in ((RECV, "jit_in_ms"), (SEND, "jit_out_ms")):
+            p = sorted(pk[direction])
+            if len(p) < 50:
+                continue
+            j, track = jitter_track(p)
+            dur = max((p[-1][0] - p[0][0]) / 1e9, 1e-9)
+            n_dom = sum(1 for _, s in p if s == j.size)
+            out.append({
+                "endpoint": mask(ep),
+                "dir": direction,
+                "pps": len(p) / dur,
+                "size": j.size,
+                "stream_pps": n_dom / dur,
+                "period_ms": j.period_ms(),
+                "jitter_ms": summarize([v for _, v in track]),
+                "etw": compare_jitter(track, etw_jitter_rows(db, ep, col), offset_ns) if db is not None else None,
+            })
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -1061,6 +1261,8 @@ def _analyse(capture: str, db: sqlite3.Connection | None, endpoint: tuple[str, i
         label = db.execute("SELECT value FROM meta WHERE key = 'label'").fetchone()
         r["run_label"] = label[0] if label else None
         r["etw"] = e
+    offset_ns = int(r.get("etw", {}).get("clock_offset_ms", 0.0) * 1e6) if r.get("etw", {}).get("matched") else 0
+    r["jitter"] = jitter_report(udps, endpoint, db, offset_ns)
     return r
 
 

@@ -386,5 +386,54 @@ class EndToEnd(unittest.TestCase):
         self.assertAlmostEqual(r["profile"]["send"]["sizes"]["97"]["count"], 10)
 
 
+class StreamJitterMirror(unittest.TestCase):
+    """Same cases as src/jitter.rs, so the two estimators agree."""
+
+    MS = 1_000_000
+    T = 83 * MS + MS // 3
+
+    def feed(self, n, delay=lambda i: 0, size=85, skip=lambda i: False):
+        return [(i * self.T + delay(i), size) for i in range(n) if not skip(i)]
+
+    def test_perfect_clock(self):
+        j, _ = ev.jitter_track(self.feed(200))
+        self.assertEqual(j.size, 85)
+        self.assertAlmostEqual(j.period_ms(), 83.333, places=2)
+        self.assertLess(j.value(), 1e-6)
+
+    def test_alternating_delay_converges_to_transit_change(self):
+        j, _ = ev.jitter_track(self.feed(400, lambda i: self.MS if i % 2 == 0 else -self.MS))
+        self.assertAlmostEqual(j.value(), 2.0, places=2)
+
+    def test_lost_packet_is_not_jitter(self):
+        j, _ = ev.jitter_track(self.feed(200, skip=lambda i: i % 10 == 5))
+        self.assertLess(j.value(), 1e-6)
+
+    def test_extra_packet_counts_as_offset(self):
+        p = self.feed(101)
+        p.insert(100, (99 * self.T + 15 * self.MS, 85))
+        j, _ = ev.jitter_track(p)
+        want = 15 / 16 + 15 * (1 - 1 / 16) / 16
+        self.assertAlmostEqual(j.value(), want, places=6)
+
+    def test_new_dominant_size_restarts(self):
+        p = self.feed(20, lambda i: self.MS if i % 2 == 0 else -self.MS)
+        p += [(30 * self.T + i * self.T, 129) for i in range(60)]
+        j, _ = ev.jitter_track(p)
+        self.assertEqual(j.size, 129)
+        self.assertLess(j.value(), 1e-6)
+
+    def test_compare_matches_delayed_rows_and_skips_settling(self):
+        # Capture J after each packet (every 100 ms); each row holds the value
+        # from 700 ms before it (ETW delivered late) and is written on the second.
+        track = [(i * 100_000_000, 0.01 * i) for i in range(1000)]
+        rows = [(t, track[t // 100_000_000 - 7][1]) for t in range(1_000_000_000, 100_000_000_000, 1_000_000_000)]
+        c = ev.compare_jitter(track, rows)
+        self.assertEqual(c["rows"], len([r for r in rows if r[0] >= rows[0][0] + ev.JIT_SETTLE_NS]))
+        self.assertAlmostEqual(c["abs_diff_ms"]["max"], 0.0, places=9)
+        self.assertAlmostEqual(c["implied_lag_ms"]["median"], 700.0)
+        self.assertAlmostEqual(c["at_row_time_diff_ms"]["median"], -0.07)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)
