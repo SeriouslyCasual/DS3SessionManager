@@ -700,7 +700,7 @@ pub fn run(args: MonitorArgs) -> Result<()> {
         // 6. Traffic snapshot every 5 s.
         if last_traffic_log.elapsed() >= Duration::from_secs(5) {
             last_traffic_log = Instant::now();
-            log_traffic(&traffic, &side, &by_endpoint, &peers, &store, t)?;
+            log_traffic(&traffic, &side, &by_endpoint, &peers, &matcher, &store, t)?;
         }
 
         if !args.quiet {
@@ -968,12 +968,14 @@ fn locate_relay(
 
 /// Write one `traffic` row per counted endpoint (peers, relays, the game's
 /// other contacts): rates, running totals, the largest inbound gap, and for
-/// wrapped relay endpoints the payload estimate.
+/// wrapped relay endpoints the payload estimate. The STUN counters (running
+/// totals) let `nrep%` be recomputed over any interval afterwards.
 fn log_traffic(
     traffic: &HashMap<SocketAddrV4, Traffic>,
     side: &SteamSide,
     by_endpoint: &HashMap<SocketAddrV4, SteamId>,
     peers: &HashMap<SteamId, PeerView>,
+    matcher: &StunMatcher,
     store: &Store,
     t: i128,
 ) -> Result<()> {
@@ -1006,6 +1008,7 @@ fn log_traffic(
             max_gap_in_ms: tr.max_gap_in_ns as f64 / 1e6,
             jit_in: stream_stats(&tr.jit_in),
             jit_out: stream_stats(&tr.jit_out),
+            stun: matcher.counters(ep),
         })?;
     }
     Ok(())

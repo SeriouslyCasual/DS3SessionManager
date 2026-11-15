@@ -28,6 +28,7 @@
 
 use crate::anon;
 use crate::model::{P2PState, RttSample, SteamId};
+use crate::stun::EndpointCounters;
 use anyhow::{Context, Result};
 use rusqlite::{Connection, params};
 use std::net::Ipv4Addr;
@@ -105,7 +106,10 @@ CREATE TABLE IF NOT EXISTS traffic (
     period_in_ms REAL,
     jit_out_ms REAL,
     stream_out_size INTEGER,
-    period_out_ms REAL
+    period_out_ms REAL,
+    stun_req INTEGER,
+    stun_matched INTEGER,
+    stun_lost INTEGER
 );
 CREATE INDEX IF NOT EXISTS traffic_by_ep ON traffic (remote_ip, remote_port, t_ns);
 CREATE INDEX IF NOT EXISTS rtt_by_peer ON rtt (steam_id, t_ns);
@@ -177,6 +181,8 @@ pub struct TrafficRow {
     /// RFC 3550 jitter of the dominant packet size, in and out (`jitter.rs`).
     pub jit_in: Option<StreamStats>,
     pub jit_out: Option<StreamStats>,
+    /// The STUN matcher's running counters for this endpoint.
+    pub stun: EndpointCounters,
 }
 
 /// One direction's periodic stream: its jitter, packet size and period.
@@ -201,7 +207,7 @@ impl Store {
             .with_context(|| format!("opening run database {}", path.display()))?;
         let old_geo = rename_old_geo(&conn)?;
         conn.execute_batch(SCHEMA)?;
-        add_jitter_columns(&conn)?;
+        add_traffic_columns(&conn)?;
         if old_geo {
             conn.execute_batch(
                 "INSERT INTO geo (steam_id, country, city, lat, lon, accuracy_km, distance_km, fiber_bound_ms)
@@ -335,9 +341,10 @@ impl Store {
         self.conn.execute(
             "INSERT INTO traffic (t_ns, steam_id, remote_ip, remote_port, role, pps_in, pps_out,
                  pkts_in, pkts_out, bytes_in, bytes_out, payload_in, payload_out, max_gap_in_ms,
-                 jit_in_ms, stream_in_size, period_in_ms, jit_out_ms, stream_out_size, period_out_ms)
+                 jit_in_ms, stream_in_size, period_in_ms, jit_out_ms, stream_out_size, period_out_ms,
+                 stun_req, stun_matched, stun_lost)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-                     ?15, ?16, ?17, ?18, ?19, ?20)",
+                     ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
             params![
                 r.t_ns as i64,
                 r.steam_id.map(|i| i.0 as i64),
@@ -359,6 +366,9 @@ impl Store {
                 r.jit_out.map(|j| j.jitter_ms),
                 r.jit_out.map(|j| j.size),
                 r.jit_out.map(|j| j.period_ms),
+                r.stun.requests as i64,
+                r.stun.matched as i64,
+                r.stun.lost_requests as i64,
             ],
         )?;
         Ok(())
@@ -509,11 +519,15 @@ impl Store {
             "jit_out_ms",
             "stream_out_size",
             "period_out_ms",
+            "stun_req",
+            "stun_matched",
+            "stun_lost",
         ])?;
         let mut q = self.conn.prepare(
             "SELECT t_ns, steam_id, remote_ip, role, pps_in, pps_out, pkts_in, pkts_out,
                     bytes_in, bytes_out, payload_in, payload_out, max_gap_in_ms,
-                    jit_in_ms, stream_in_size, period_in_ms, jit_out_ms, stream_out_size, period_out_ms
+                    jit_in_ms, stream_in_size, period_in_ms, jit_out_ms, stream_out_size, period_out_ms,
+                    stun_req, stun_matched, stun_lost
              FROM traffic ORDER BY t_ns",
         )?;
         let mut rows = q.query([])?;
@@ -544,6 +558,9 @@ impl Store {
                 opt_f(r.get(16)?),
                 opt_i(r.get(17)?),
                 opt_f(r.get(18)?),
+                opt_i(r.get(19)?),
+                opt_i(r.get(20)?),
+                opt_i(r.get(21)?),
             ])?;
         }
         w.flush()?;
@@ -567,9 +584,9 @@ fn rename_old_geo(conn: &Connection) -> Result<bool> {
     Ok(true)
 }
 
-/// Run databases from before stream jitter have a `traffic` table without
-/// the jitter columns; add them (as NULL for the old rows).
-fn add_jitter_columns(conn: &Connection) -> Result<()> {
+/// Run databases from before stream jitter (or the STUN counters) have a
+/// `traffic` table without those columns; add them (NULL for old rows).
+fn add_traffic_columns(conn: &Connection) -> Result<()> {
     let cols: Vec<String> = conn
         .prepare("SELECT name FROM pragma_table_info('traffic')")?
         .query_map([], |r| r.get(0))?
@@ -581,6 +598,9 @@ fn add_jitter_columns(conn: &Connection) -> Result<()> {
         ("jit_out_ms", "REAL"),
         ("stream_out_size", "INTEGER"),
         ("period_out_ms", "REAL"),
+        ("stun_req", "INTEGER"),
+        ("stun_matched", "INTEGER"),
+        ("stun_lost", "INTEGER"),
     ] {
         if !cols.iter().any(|c| c == name) {
             conn.execute_batch(&format!("ALTER TABLE traffic ADD COLUMN {name} {ty};"))?;
@@ -660,6 +680,12 @@ mod tests {
                 period_ms: 83.333,
             }),
             jit_out: None,
+            stun: EndpointCounters {
+                requests: 12,
+                matched: 11,
+                lost_requests: 1,
+                ..Default::default()
+            },
         })
         .unwrap();
         let geo = |site| GeoRow {
@@ -690,7 +716,7 @@ mod tests {
         assert!(all.contains("198.51.100.0/24,relay_wrapped"));
         assert!(!all.contains("198.51.100.148"));
         assert!(all.contains(",850,136,"));
-        assert!(all.contains(",2.679,129,83.333,,,"));
+        assert!(all.contains(",2.679,129,83.333,,,,12,11,1"));
         // Peer and relay rows both kept; one peers.csv line carries both.
         let peers = std::fs::read_to_string(out.join("peers.csv")).unwrap();
         assert_eq!(peers.lines().count(), 2);
@@ -790,6 +816,7 @@ mod tests {
             max_gap_in_ms: 90.0,
             jit_in: Some(stream(0.4)),
             jit_out: Some(stream(0.1)),
+            stun: EndpointCounters::default(),
         })
         .unwrap();
         let rows: Vec<(i64, Option<f64>, Option<f64>)> = s
