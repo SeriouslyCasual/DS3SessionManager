@@ -31,7 +31,9 @@
 //! - **P**, traffic asymmetry (no lists involved): Steam's remote carries our
 //!   game-rate sends but almost nothing back (only the ~2/s STUN replies),
 //!   while another steam.exe endpoint receives game-rate inbound traffic. A
-//!   direct peer sends its ~20/s back on the same endpoint.
+//!   direct peer sends its ~20/s back on the same endpoint. Never fires for
+//!   a remote on a private or other local address: relays are public, and a
+//!   LAN peer can answer from a sibling port.
 //! - **A**, ASN database: the optional DB-IP ASN file says the remote IP
 //!   belongs to Valve's network (AS32590).
 //! - **L**, built-in list: the remote IP is in Valve's announced address
@@ -60,7 +62,7 @@
 
 use std::collections::HashSet;
 use std::fmt;
-use std::net::SocketAddrV4;
+use std::net::{Ipv4Addr, SocketAddrV4};
 use std::str::FromStr;
 
 /// Minimum combined (in + out) packets/second for an endpoint to look like a
@@ -268,15 +270,36 @@ pub fn pick(
         .map(|c| c.ep)
 }
 
+/// Whether an address can only be reached on a local network: private
+/// (RFC 1918), shared carrier-grade NAT space (RFC 6598, `100.64.0.0/10`),
+/// link-local, loopback or unspecified. Valve's relays are always on public
+/// addresses, so such a remote is never a relay.
+pub fn is_local_address(ip: Ipv4Addr) -> bool {
+    let [a, b, ..] = ip.octets();
+    ip.is_private()
+        || ip.is_link_local()
+        || ip.is_loopback()
+        || ip.is_unspecified()
+        || (a == 100 && (64..128).contains(&b))
+}
+
 /// Detector P: Steam's remote carries our game-rate sends but almost nothing
 /// back, while another endpoint receives game-rate inbound traffic.
 /// `claimed` holds endpoints Steam reports for *other* peers, which never
 /// count as that other endpoint.
+///
+/// A remote on a local address never fires P. On a LAN, after Steam returns
+/// from its TCP fallback (E3), the peer can answer from a sibling socket:
+/// our sends go to `:49908` while its ~15/s arrive from `:49909` on the same
+/// host. That's the same asymmetry as a relay, but no relay is involved.
 pub fn pattern(
     remote: SocketAddrV4,
     candidates: &[Candidate],
     claimed: &HashSet<SocketAddrV4>,
 ) -> bool {
+    if is_local_address(*remote.ip()) {
+        return false;
+    }
     let Some(r) = candidates.iter().find(|c| c.ep == remote) else {
         return false;
     };
@@ -496,6 +519,52 @@ mod tests {
         assert!(!pattern(reported, &[asym, stun], &HashSet::new()));
         // Steam's remote carries no traffic at all (E1 mode): not P's case.
         assert!(!pattern(reported, &[busy_other], &HashSet::new()));
+    }
+
+    #[test]
+    fn pattern_ignores_lan_peer_answering_from_a_sibling_port() {
+        // E3, after the TCP fallback ended: we send ~34/s to Steam's remote
+        // :49908 and get only the ~2/s STUN replies there, while the peer's
+        // ~15/s arrive from :49909 on the same LAN host.
+        let lan = |port| SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 15), port);
+        let reported = lan(49908);
+        let cands = [
+            cd(reported, 2.0, 34.0, true, false),
+            cd(lan(49909), 15.0, 1.0, true, false),
+        ];
+        assert!(!pattern(reported, &cands, &HashSet::new()));
+
+        // The same traffic on public addresses would still fire P.
+        let reported = ep(15, 49908);
+        let cands = [
+            cd(reported, 2.0, 34.0, true, false),
+            cd(ep(15, 49909), 15.0, 1.0, true, false),
+        ];
+        assert!(pattern(reported, &cands, &HashSet::new()));
+    }
+
+    #[test]
+    fn local_addresses_are_recognized() {
+        for ip in [
+            [10, 0, 0, 1],
+            [172, 16, 5, 4],
+            [192, 168, 1, 15],
+            [100, 64, 0, 1],
+            [100, 127, 255, 254],
+            [169, 254, 1, 1],
+            [127, 0, 0, 1],
+            [0, 0, 0, 0],
+        ] {
+            assert!(is_local_address(Ipv4Addr::from(ip)), "{ip:?}");
+        }
+        for ip in [
+            [155, 133, 226, 78],
+            [100, 128, 0, 1],
+            [172, 32, 0, 1],
+            [203, 0, 113, 15],
+        ] {
+            assert!(!is_local_address(Ipv4Addr::from(ip)), "{ip:?}");
+        }
     }
 
     #[test]
