@@ -26,6 +26,7 @@
 //! | `event`     | notable happening (game restarted, peer left)  |
 //! | `traffic`   | endpoint every 5 s (rates, gaps, jitter)       |
 //! | `tcp_seg`   | steam.exe TCP segment to a peer (`--tcp` only) |
+//! | `tcp_estats`| TCP fallback connection stats per poll (`--tcp`)|
 
 use crate::anon;
 use crate::model::{P2PState, RttSample, SteamId};
@@ -77,6 +78,20 @@ CREATE TABLE IF NOT EXISTS tcp_seg (
     size INTEGER NOT NULL,
     send_start INTEGER,
     send_end INTEGER
+);
+CREATE TABLE IF NOT EXISTS tcp_estats (
+    t_ns INTEGER NOT NULL,
+    remote_ip TEXT NOT NULL,
+    remote_port INTEGER NOT NULL,
+    sample_rtt INTEGER NOT NULL,
+    smoothed_rtt INTEGER NOT NULL,
+    rtt_var INTEGER NOT NULL,
+    min_rtt INTEGER NOT NULL,
+    max_rtt INTEGER NOT NULL,
+    sum_rtt INTEGER NOT NULL,
+    count_rtt INTEGER NOT NULL,
+    pkts_retrans INTEGER NOT NULL,
+    timeouts INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS geo (
     steam_id INTEGER NOT NULL,
@@ -312,6 +327,35 @@ impl Store {
                 size,
                 send_times.map(|s| s.0),
                 send_times.map(|s| s.1),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// One reading of Windows' TCP statistics for a fallback connection
+    /// (`monitor --tcp`), in milliseconds and running counters, as read.
+    #[cfg(windows)]
+    pub fn insert_tcp_estats(
+        &self,
+        t_ns: i128,
+        remote: std::net::SocketAddrV4,
+        s: &crate::estats::PathStats,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO tcp_estats VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                t_ns as i64,
+                remote.ip().to_string(),
+                remote.port(),
+                s.sample_rtt,
+                s.smoothed_rtt,
+                s.rtt_var,
+                s.min_rtt,
+                s.max_rtt,
+                s.sum_rtt,
+                s.count_rtt,
+                s.pkts_retrans,
+                s.timeouts,
             ],
         )?;
         Ok(())

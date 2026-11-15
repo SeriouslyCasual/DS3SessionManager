@@ -27,6 +27,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 
 use crate::MonitorArgs;
+use crate::estats;
 use crate::etw::{self, ByteOrder};
 use crate::geo::{self, AsnDb, GeoDb, GeoInfo, LatLon};
 use crate::jitter::StreamJitter;
@@ -369,6 +370,18 @@ struct PeerView {
     /// Whether the peer is currently measured from Steam's TCP fallback
     /// (`--tcp`).
     on_tcp: bool,
+    /// RTT on the TCP fallback, from Windows' TCP statistics (`estats.rs`),
+    /// kept apart from the UDP `rtt`.
+    tcp_rtt: Rolling,
+    /// The fallback connection whose statistics are being read.
+    tcp_conn: Option<TcpConn>,
+}
+
+/// Steam's TCP fallback connection to a peer, with statistics collection on.
+struct TcpConn {
+    remote: SocketAddrV4,
+    row: windows::Win32::NetworkManagement::IpHelper::MIB_TCPROW_LH,
+    last: Option<estats::PathStats>,
 }
 
 /// How long an active session must stay silent on UDP, beyond the 5 s rate
@@ -434,6 +447,8 @@ impl PeerView {
             unseen_since: None,
             unseen_logged: false,
             on_tcp: false,
+            tcp_rtt: Rolling::new(window),
+            tcp_conn: None,
         }
     }
 
@@ -716,6 +731,7 @@ pub fn run(args: MonitorArgs) -> Result<()> {
                 view.unseen_since = None;
                 view.unseen_logged = false;
                 view.on_tcp = false;
+                view.tcp_conn = None;
             }
         }
 
@@ -780,6 +796,11 @@ pub fn run(args: MonitorArgs) -> Result<()> {
                 };
                 store.event(t, kind, &format!("{id} {remote}"))?;
                 view.on_tcp = on_tcp;
+            }
+            if let (Some(tp), Some(r)) = (&tcp_paths, st.remote)
+                && tp.path(&r).is_some()
+            {
+                tcp_rtt_step(view, *id, r, steam_pid, &store, t)?;
             }
             view.unseen_since = unseen_step(
                 view.unseen_since,
@@ -1288,6 +1309,63 @@ fn drain_tcp(
     Ok(())
 }
 
+/// RTT on the TCP fallback from Windows' TCP statistics: find Steam's
+/// connection to `remote` once (and switch its statistics on), then read
+/// them every poll. Each reading is logged in `tcp_estats`; when TCP took
+/// new RTT samples since the last reading, their mean is stored as a
+/// `tcp_estats` RTT sample and added to the peer's `tcp_rtt`.
+fn tcp_rtt_step(
+    view: &mut PeerView,
+    id: SteamId,
+    remote: SocketAddrV4,
+    steam_pid: u32,
+    store: &Store,
+    t: i128,
+) -> Result<()> {
+    if view.tcp_conn.as_ref().is_none_or(|c| c.remote != remote) {
+        view.tcp_conn = None;
+        let Some(row) = estats::find_connection(remote, steam_pid) else {
+            return Ok(());
+        };
+        match estats::enable(&row) {
+            Ok(()) => store.event(t, "tcp_estats_on", &format!("{id} {remote}"))?,
+            Err(e) => {
+                store.event(t, "tcp_estats_err", &format!("{id} {remote} enable {e}"))?;
+                return Ok(());
+            }
+        }
+        view.tcp_conn = Some(TcpConn {
+            remote,
+            row,
+            last: None,
+        });
+    }
+    let Some(conn) = view.tcp_conn.as_mut() else {
+        return Ok(());
+    };
+    match estats::read(&conn.row) {
+        Ok(s) => {
+            store.insert_tcp_estats(t, remote, &s)?;
+            if let Some(mean) = conn.last.and_then(|p| s.interval_mean(&p)) {
+                let sample = RttSample {
+                    t_ns: t,
+                    rtt_ms: mean,
+                    source: RttSource::TcpEstats,
+                };
+                store.insert_rtt(Some(id), remote, &sample)?;
+                view.tcp_rtt.push(mean);
+            }
+            conn.last = Some(s);
+        }
+        Err(e) => {
+            // The connection closed or changed: look it up again next poll.
+            store.event(t, "tcp_estats_err", &format!("{id} {remote} read {e}"))?;
+            view.tcp_conn = None;
+        }
+    }
+    Ok(())
+}
+
 /// One `traffic` row per TCP fallback path, role `peer_tcp`, with the TCP
 /// matcher's counters in the STUN columns. Written next to the UDP rows,
 /// which are unchanged.
@@ -1418,15 +1496,15 @@ fn draw(
         let Some(v) = peers.get(id) else { continue };
         // On Steam's TCP fallback (`--tcp`), the row is measured from TCP:
         // jitter from the framed stream, the loss column shows outbound
-        // resends, and RTT is "-" (TCP send events are stamped at
-        // acknowledgement, so no honest RTT). Otherwise UDP, as always.
+        // resends, and RTT comes from Windows' TCP statistics (whole ms).
+        // Otherwise UDP, as always.
         let tcp_path = if v.on_tcp {
             tcp.zip(v.state.remote).and_then(|(tp, r)| tp.path(&r))
         } else {
             None
         };
         let s = if tcp_path.is_some() {
-            None
+            v.tcp_rtt.summary()
         } else {
             v.rtt.summary()
         };
@@ -1557,8 +1635,8 @@ fn draw(
     }
     if shown.iter().any(|(_, v)| v.on_tcp) {
         out.push_str(
-            "tcp = Steam moved this connection to its TCP fallback (direct, not a relay): jit comes from TCP \
-             and includes its resend delay; nrep% shows outbound resends (r); RTT can't be measured on TCP (-)\n",
+            "tcp = Steam moved this connection to its TCP fallback (direct, not a relay): RTT is Windows' own \
+             TCP measurement (whole ms); jit includes TCP's resend delay; nrep% shows outbound resends (r)\n",
         );
     }
     let any_relayed = shown.iter().any(|(_, v)| v.evidence.relayed(det));

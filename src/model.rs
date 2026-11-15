@@ -118,6 +118,11 @@ pub struct P2PState {
 pub enum RttSource {
     /// Kernel ETW UDP send/receive timing of STUN-sized packets.
     EtwStun,
+    /// On Steam's TCP fallback: Windows' own TCP RTT for the connection
+    /// (TCP ESTATS, `estats.rs`), the mean of the samples TCP took since
+    /// the previous reading. Whole ms; a different method from the checks.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    TcpEstats,
 }
 
 impl RttSource {
@@ -125,6 +130,7 @@ impl RttSource {
     pub fn as_str(self) -> &'static str {
         match self {
             RttSource::EtwStun => "etw_stun",
+            RttSource::TcpEstats => "tcp_estats",
         }
     }
 }
