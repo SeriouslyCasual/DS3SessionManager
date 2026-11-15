@@ -1269,16 +1269,21 @@ fn drain_tcp(
     };
     while let Ok(raw) = rx.try_recv() {
         let s = bo.decode_tcp(&raw);
-        let Some(id) = (s.pid == steam_pid)
-            .then(|| by_endpoint.get(&s.remote).copied())
-            .flatten()
-        else {
+        // Outbound events must be steam.exe's; inbound ones were already
+        // matched to steam.exe's connection by local port in `etw.rs` (the
+        // kernel doesn't log steam.exe's PID on them).
+        let outbound = matches!(s.kind, etw::TcpKind::Send | etw::TcpKind::Retransmit);
+        if outbound && s.pid != steam_pid {
+            continue;
+        }
+        let Some(id) = by_endpoint.get(&s.remote).copied() else {
             continue;
         };
         let kind = match s.kind {
             etw::TcpKind::Send => "send",
             etw::TcpKind::Recv => "recv",
             etw::TcpKind::Retransmit => "retx",
+            etw::TcpKind::Copy => "copy",
         };
         store.insert_tcp_seg(s.t_ns, s.remote, kind, s.size)?;
         if let Some(m) = tcp.observe(&s) {

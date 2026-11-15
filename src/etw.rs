@@ -35,6 +35,7 @@
 //! queue). The game's PID travels the other way through an *atomic* integer
 //! shared with `Arc`. See `start()` for the details.
 
+use std::collections::HashSet;
 use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
@@ -98,12 +99,23 @@ static TCP_IP_PROVIDER: KernelProvider = KernelProvider::new(
     0x0001_0000, // EVENT_TRACE_FLAG_NETWORK_TCPIP
 );
 
-/// `TcpIp` opcodes for IPv4: send (`TcpIp_SendIPV4`), receive and
-/// retransmit (`TcpIp_TypeGroup1`). All carry PID, size, daddr, saddr,
-/// dport and sport, like the UDP events.
+/// `TcpIp` opcodes for IPv4: send (`TcpIp_SendIPV4`), receive,
+/// retransmit and copy-to-application (`TcpIp_TypeGroup1`). All carry PID,
+/// size, daddr, saddr, dport and sport, like the UDP events.
+///
+/// E3-T (2026-11-15) showed two things about Steam's fallback connection:
+/// send events come **one per message** (sizes 58/70/87/99, same total
+/// bytes as the capture, even when TCP packed several messages into one
+/// segment); and **no receive event carried steam.exe's PID**. Receives
+/// are therefore matched by connection instead: their local port must be
+/// one steam.exe has sent from.
 const OP_TCP_SEND_V4: u8 = 10;
 const OP_TCP_RECV_V4: u8 = 11;
 const OP_TCP_RETRANSMIT_V4: u8 = 14;
+const OP_TCP_COPY_V4: u8 = 18;
+/// Local ports remembered from steam.exe's TCP sends; the set is cleared
+/// when it grows past this (old connections), and refills from new sends.
+const MAX_STEAM_TCP_PORTS: usize = 64;
 
 /// What a TCP event reports.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -112,6 +124,10 @@ pub enum TcpKind {
     Recv,
     /// A segment this PC sent again (a loss signal, outbound only).
     Retransmit,
+    /// Received data copied to the application (`TCPCopy`). Recorded so a
+    /// run can show whether it or `Recv` gives per-message timing; used as
+    /// a receive only when a connection has no `Recv` events.
+    Copy,
 }
 
 /// One raw TCP event, before byte-order decoding. Same fields as [`RawUdp`].
@@ -209,7 +225,9 @@ impl ByteOrder {
             TcpKind::Send | TcpKind::Retransmit => {
                 SocketAddrV4::new(self.addr(r.daddr), self.port(r.dport))
             }
-            TcpKind::Recv => SocketAddrV4::new(self.addr(r.saddr), self.port(r.sport)),
+            TcpKind::Recv | TcpKind::Copy => {
+                SocketAddrV4::new(self.addr(r.saddr), self.port(r.sport))
+            }
         };
         TcpSegment {
             t_ns: r.t_ns,
@@ -376,14 +394,18 @@ fn parse_event(
     })
 }
 
-/// Turn one `TcpIp` event into a `RawTcp`, or `None` if it isn't an IPv4
-/// send/receive/retransmit by steam.exe. Runs on ferrisetw's thread for every
-/// TCP event on the PC, so, like [`parse_event`], it checks the opcode first
-/// and drops other processes as soon as the PID is read.
+/// Turn one `TcpIp` event into a `RawTcp`, or `None` if it isn't one of
+/// steam.exe's IPv4 TCP events. Runs on ferrisetw's thread for every TCP
+/// event on the PC, so, like [`parse_event`], it checks the opcode first.
+/// Sends and retransmits must carry steam.exe's PID, and their local port
+/// is remembered in `ports` (raw, undecoded values). Receives and copies
+/// are kept when their local port is in `ports` (or the PID matches),
+/// because the kernel doesn't log steam.exe's PID on them.
 fn parse_tcp_event(
     record: &EventRecord,
     locator: &SchemaLocator,
     steam_pid: u32,
+    ports: &mut HashSet<u16>,
     diag: &Diag,
 ) -> Option<RawTcp> {
     let op = record.opcode();
@@ -393,6 +415,7 @@ fn parse_tcp_event(
         OP_TCP_SEND_V4 => TcpKind::Send,
         OP_TCP_RECV_V4 => TcpKind::Recv,
         OP_TCP_RETRANSMIT_V4 => TcpKind::Retransmit,
+        OP_TCP_COPY_V4 => TcpKind::Copy,
         _ => return None,
     };
     if steam_pid == u32::MAX {
@@ -421,7 +444,9 @@ fn parse_tcp_event(
         };
     }
     let pid: u32 = field!("PID");
-    if pid != steam_pid {
+    let sport: u16 = field!("sport");
+    let dport: u16 = field!("dport");
+    if !keep_tcp(kind, pid == steam_pid, sport, dport, ports) {
         return None;
     }
     let ft = record.raw_timestamp();
@@ -431,10 +456,34 @@ fn parse_tcp_event(
         kind,
         daddr: field!("daddr"),
         saddr: field!("saddr"),
-        dport: field!("dport"),
-        sport: field!("sport"),
+        dport,
+        sport,
         size: field!("size"),
     })
+}
+
+/// The TCP keep rule (see [`parse_tcp_event`]): outbound events need
+/// steam.exe's PID and teach their local port (`sport`); inbound events
+/// need that local port (their `dport`) or the PID.
+fn keep_tcp(
+    kind: TcpKind,
+    is_steam: bool,
+    sport: u16,
+    dport: u16,
+    ports: &mut HashSet<u16>,
+) -> bool {
+    match kind {
+        TcpKind::Send | TcpKind::Retransmit => {
+            if is_steam {
+                if ports.len() >= MAX_STEAM_TCP_PORTS && !ports.contains(&sport) {
+                    ports.clear();
+                }
+                ports.insert(sport);
+            }
+            is_steam
+        }
+        TcpKind::Recv | TcpKind::Copy => is_steam || ports.contains(&dport),
+    }
 }
 
 /// Start the kernel UDP trace. Requires administrator rights.
@@ -498,8 +547,15 @@ pub fn start_with(tcp: bool) -> Result<UdpTrace> {
         let (ttx, trx): (Sender<RawTcp>, Receiver<RawTcp>) = channel();
         let td = Arc::new(Diag::default());
         let (sp2, td2) = (Arc::clone(&steam_pid), Arc::clone(&td));
+        let mut ports: HashSet<u16> = HashSet::new();
         let tcp_cb = move |record: &EventRecord, locator: &SchemaLocator| {
-            if let Some(ev) = parse_tcp_event(record, locator, sp2.load(Ordering::Relaxed), &td2) {
+            if let Some(ev) = parse_tcp_event(
+                record,
+                locator,
+                sp2.load(Ordering::Relaxed),
+                &mut ports,
+                &td2,
+            ) {
                 let _ = ttx.send(ev);
             }
         };
@@ -619,6 +675,28 @@ mod tests {
             GUID::from("9a280ac0-c8e0-11d1-84e2-00c04fb998a2")
         );
         assert_eq!(TCP_IP_PROVIDER.flags, UDP_IP_PROVIDER.flags);
+    }
+
+    /// E3-T: receives carried no steam.exe PID. They're kept by local port,
+    /// learned from steam.exe's sends; other processes' traffic is not.
+    #[test]
+    fn tcp_receives_are_kept_by_steams_local_port() {
+        let mut ports = HashSet::new();
+        // Before any send, a receive on the port isn't known yet.
+        assert!(!keep_tcp(TcpKind::Recv, false, 49202, 53795, &mut ports));
+        // A steam.exe send from local port 53795 teaches the port.
+        assert!(keep_tcp(TcpKind::Send, true, 53795, 49202, &mut ports));
+        assert!(keep_tcp(TcpKind::Recv, false, 49202, 53795, &mut ports));
+        assert!(keep_tcp(TcpKind::Copy, false, 49202, 53795, &mut ports));
+        // Another process: its sends are dropped and teach nothing.
+        assert!(!keep_tcp(TcpKind::Send, false, 60000, 443, &mut ports));
+        assert!(!keep_tcp(TcpKind::Recv, false, 443, 60000, &mut ports));
+        // The set stays bounded.
+        for p in 0..200u16 {
+            keep_tcp(TcpKind::Send, true, 1000 + p, 80, &mut ports);
+        }
+        assert!(ports.len() <= MAX_STEAM_TCP_PORTS);
+        assert!(ports.contains(&1199));
     }
 
     #[test]

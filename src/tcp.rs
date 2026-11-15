@@ -55,6 +55,10 @@ pub struct TcpPath {
     pub jit_out: StreamJitter,
     pub max_gap_in_ns: i128,
     last_in_ns: i128,
+    /// Kernel receive events seen on this connection; until one is, the
+    /// copy-to-application events stand in for them.
+    saw_recv: bool,
+    pub copies: u64,
 }
 
 impl TcpPath {
@@ -90,7 +94,21 @@ impl TcpPaths {
     /// a framed check reply completes a pair.
     pub fn observe(&mut self, s: &TcpSegment) -> Option<Matched> {
         let p = self.paths.entry(s.remote).or_default();
-        let dir = match s.kind {
+        let kind = match s.kind {
+            TcpKind::Copy => {
+                p.copies += 1;
+                if p.saw_recv {
+                    return None;
+                }
+                TcpKind::Recv
+            }
+            TcpKind::Recv => {
+                p.saw_recv = true;
+                TcpKind::Recv
+            }
+            k => k,
+        };
+        let dir = match kind {
             TcpKind::Retransmit => {
                 p.retransmits += 1;
                 p.rate_retx.push(s.t_ns);
@@ -103,7 +121,7 @@ impl TcpPaths {
                 p.jit_out.observe(s.size, s.t_ns);
                 Direction::Send
             }
-            TcpKind::Recv => {
+            TcpKind::Recv | TcpKind::Copy => {
                 p.pkts_in += 1;
                 p.bytes_in += s.size as u64;
                 p.rate_in.push(s.t_ns);
@@ -195,6 +213,20 @@ mod tests {
         assert_eq!(path.jit_in.size(), Some(87));
         assert!(path.jit_in.jitter_ms().unwrap() < 1e-6);
         assert!(p.receiving(&peer(), 299 * T + 2_000 * MS));
+    }
+
+    /// Copy events count as receives only on a connection without kernel
+    /// receive events; once a receive is seen, copies are only counted.
+    #[test]
+    fn copies_stand_in_until_receives_appear() {
+        let mut p = TcpPaths::new(56, 68);
+        p.observe(&seg(0, TcpKind::Send, 58));
+        let m = p.observe(&seg(2 * MS, TcpKind::Copy, 70)).unwrap();
+        assert!((m.rtt_ms - 2.0).abs() < 1e-9);
+        p.observe(&seg(10 * MS, TcpKind::Recv, 87));
+        p.observe(&seg(11 * MS, TcpKind::Copy, 87));
+        let path = p.path(&peer()).unwrap();
+        assert_eq!((path.pkts_in, path.copies), (2, 2));
     }
 
     /// Retransmits count against segments sent, over the rate window.
