@@ -323,6 +323,35 @@ pub fn self_test() -> Result<()> {
         };
         println!("{line}");
     }
+    // Control: a built-in provider that always logs network events. If it
+    // counts events while the capture provider counts none, this program's
+    // event session works and the capture provider needs switching on.
+    let control = (|| -> Result<u64> {
+        let n = Arc::new(AtomicU64::new(0));
+        let n2 = Arc::clone(&n);
+        let provider = Provider::by_guid(TCPIP_PROVIDER)
+            .any(u64::MAX)
+            .level(5)
+            .add_callback(move |_: &EventRecord, _: &SchemaLocator| {
+                n2.fetch_add(1, Ordering::Relaxed);
+            })
+            .build();
+        let _trace = UserTrace::new()
+            .named(format!("ds3sm-control-{}", std::process::id()))
+            .enable(provider)
+            .start_and_process()
+            .map_err(|e| anyhow!("{e:?}"))?;
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(TEST_SECS);
+        while std::time::Instant::now() < end {
+            let _ = sock.send_to(&[0u8; 37], target);
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        Ok(n.load(Ordering::Relaxed))
+    })();
+    match control {
+        Ok(n) => println!("{:<48} {:>10}", "control: Microsoft-Windows-TCPIP", n),
+        Err(e) => println!("{:<48} failed: {e:#}", "control: Microsoft-Windows-TCPIP"),
+    }
     println!(
         "\n'packet events' should be well above 0 (this test alone sends {} packets).",
         TEST_SECS * 10
@@ -332,6 +361,8 @@ pub fn self_test() -> Result<()> {
 }
 
 const TEST_SECS: u64 = 6;
+/// `Microsoft-Windows-TCPIP`, the self-test's control provider.
+const TCPIP_PROVIDER: &str = "2f07e2ee-15db-40f1-90ef-9d7ba282188a";
 
 #[cfg(test)]
 mod tests {
