@@ -32,6 +32,8 @@ use crate::etw::{self, ByteOrder};
 use crate::geo::{self, AsnDb, GeoDb, GeoInfo, LatLon};
 use crate::jitter::StreamJitter;
 use crate::model::{P2PState, Provenance, RttSample, RttSource, SteamId};
+use crate::ndiscap;
+use crate::playerip::{self, Sighting, Source};
 use crate::relay::{self, Detectors, Evidence, Role};
 use crate::stats::Rolling;
 use crate::steam::Steam;
@@ -265,6 +267,8 @@ struct Traffic {
     bytes_out: u64,
     bytes_in: u64,
     last_in_ns: i128,
+    /// First received packet (when an inbound stream started), ns.
+    first_in_ns: i128,
     /// Largest gap between received packets, ns (a stall indicator).
     max_gap_in_ns: i128,
     /// Timestamps for the packets/second columns.
@@ -392,6 +396,13 @@ struct PeerView {
     tcp_rtt: Rolling,
     /// The fallback connection whose statistics are being read.
     tcp_conn: Option<TcpConn>,
+    /// Steam's remote when the current relay episode started (a change
+    /// starts a new episode for `playerip`).
+    relay_remote: Option<SocketAddrV4>,
+    /// The player's own address, once linked (`playerip.rs`), and the
+    /// endpoint its direct inbound stream arrives from, if it comes that way.
+    player_link: Option<playerip::Link>,
+    player_ep: Option<SocketAddrV4>,
 }
 
 /// Steam's TCP fallback connection to a peer, with statistics collection on.
@@ -469,18 +480,22 @@ impl PeerView {
             on_tcp: false,
             tcp_rtt: Rolling::new(window),
             tcp_conn: None,
+            relay_remote: None,
+            player_link: None,
+            player_ep: None,
         }
     }
 
     /// Every endpoint whose traffic counts for this peer: Steam's reported
-    /// remote and the attributed relay endpoints.
+    /// remote, the attributed relay endpoints, and the player's direct
+    /// inbound stream on a relayed session (`playerip.rs`).
     fn endpoints(&self) -> Vec<SocketAddrV4> {
         let mut v: Vec<SocketAddrV4> = self.state.remote.into_iter().collect();
-        v.extend(
-            self.relay_eps
-                .iter()
-                .filter(|e| Some(**e) != self.state.remote),
-        );
+        for e in self.relay_eps.iter().chain(&self.player_ep) {
+            if !v.contains(e) {
+                v.push(*e);
+            }
+        }
         v
     }
 
@@ -646,6 +661,11 @@ pub fn run(args: MonitorArgs) -> Result<()> {
     if tcp_paths.is_some() {
         store.set_meta("tcp_fallback", "on")?;
     }
+    // Relayed players' own addresses (`playerip.rs`): direct streams from ETW,
+    // plus relay wrapper headers (`ndiscap.rs`, on unless
+    // `--no-relay-header`).
+    let mut players = playerip::Matcher::default();
+    let mut hdr = RelayHeader::new(!args.no_relay_header && trace.is_some(), &store)?;
 
     // Main loop. ETW events are drained every ~10 ms, but Steam is polled and
     // the table redrawn only every `interval` (default 500 ms). Packet
@@ -669,6 +689,8 @@ pub fn run(args: MonitorArgs) -> Result<()> {
                 &store,
             )?;
         }
+        // 1a. Relay wrapper headers.
+        hdr.drain(&mut players, &store)?;
         // 1b. Drain TCP fallback events (on unless `--no-tcp`).
         if let (Some(t), Some(bo), Some(tp)) = (&trace, byte_order, tcp_paths.as_mut()) {
             drain_tcp(t, bo, steam_pid, tp, &by_endpoint, &store)?;
@@ -781,12 +803,30 @@ pub fn run(args: MonitorArgs) -> Result<()> {
             t,
         )?;
 
-        // 5. Place the player, unless Steam's remote turned out to be a relay.
+        // 4b. Relayed players' own addresses.
+        hdr.guard(&store)?;
+        update_players(&active, &mut peers, &mut players, &side, &ctx, &store, t)?;
+
+        // 5. Place the player, unless Steam's remote turned out to be a relay
+        //    (then use the player's linked address, if any).
         for (id, st) in &active {
             let (Some(view), Some(remote)) = (peers.get_mut(id), st.remote) else {
                 continue;
             };
             if view.evidence.remote_is_relay(&ctx.detectors) {
+                if let Some(l) = view.player_link {
+                    if view.geo_ip != Some(l.ip) {
+                        locate(
+                            view,
+                            *id,
+                            SocketAddrV4::new(l.ip, 0),
+                            geodb.as_ref(),
+                            home,
+                            &store,
+                        )?;
+                    }
+                    continue;
+                }
                 // An address first taken for the player can turn out to be a
                 // relay (pattern evidence needs a few seconds of traffic).
                 if view.geo_ip == Some(*remote.ip()) {
@@ -871,14 +911,246 @@ pub fn run(args: MonitorArgs) -> Result<()> {
                 &ctx,
                 trace.is_some(),
                 tcp_paths.as_ref(),
+                hdr.status(),
             );
         }
     }
     if let Some(d) = trace.as_ref().and_then(|t| t.tcp_diag.as_ref()) {
         store.event(now_ns(), "etw_tcp_diag", &d.summary())?;
     }
+    hdr.finish(&store)?;
     store.event(now_ns(), "stop", "")?;
     println!("run saved to {}", db_path.display());
+    Ok(())
+}
+
+/// Relay wrapper header reading (`ndiscap.rs`), with its cost guard: while
+/// the PC receives more than `ndiscap::MAX_EVENTS_PER_S` packets a second,
+/// the capture is stopped, and started again [`HDR_RETRY`] later.
+struct RelayHeader {
+    enabled: bool,
+    cap: Option<ndiscap::Capture>,
+    paused_until: Option<Instant>,
+    last: (Instant, u64),
+    /// Totals over the run, logged at the end.
+    events: u64,
+    wrapped: u64,
+}
+
+const HDR_RETRY: Duration = Duration::from_secs(120);
+
+impl RelayHeader {
+    fn new(enabled: bool, store: &Store) -> Result<Self> {
+        let mut h = Self {
+            enabled,
+            cap: None,
+            paused_until: None,
+            last: (Instant::now(), 0),
+            events: 0,
+            wrapped: 0,
+        };
+        if enabled {
+            h.start(store)?;
+        }
+        store.set_meta(
+            "relay_header",
+            match (enabled, h.cap.is_some()) {
+                (false, _) => "off",
+                (true, true) => "on",
+                (true, false) => "unavailable",
+            },
+        )?;
+        Ok(h)
+    }
+
+    fn start(&mut self, store: &Store) -> Result<()> {
+        match ndiscap::start() {
+            Ok(c) => {
+                self.cap = Some(c);
+                self.last = (Instant::now(), 0);
+                store.event(now_ns(), "relay_header_on", "")?;
+            }
+            Err(e) => {
+                eprintln!("note: relay header reading unavailable: {e:#}");
+                store.event(now_ns(), "relay_header_err", &format!("{e:#}"))?;
+                self.enabled = false;
+            }
+        }
+        Ok(())
+    }
+
+    /// Feed wrapped addresses to the matcher.
+    fn drain(&mut self, players: &mut playerip::Matcher, store: &Store) -> Result<()> {
+        let Some(c) = &self.cap else { return Ok(()) };
+        while let Ok(w) = c.rx.try_recv() {
+            let s = Sighting {
+                ep: w.player,
+                t_ns: w.t_ns,
+                source: Source::Wrapper,
+            };
+            if players.sighting(s) {
+                store.insert_player_seen(s.t_ns, s.ep, Source::Wrapper.as_str())?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Pause under heavy traffic; resume after `HDR_RETRY`.
+    fn guard(&mut self, store: &Store) -> Result<()> {
+        if let Some(c) = &self.cap {
+            let el = self.last.0.elapsed();
+            if el >= Duration::from_secs(5) {
+                let n = c.events.load(Ordering::Relaxed);
+                let rate = (n - self.last.1) as f64 / el.as_secs_f64();
+                self.last = (Instant::now(), n);
+                if rate > ndiscap::MAX_EVENTS_PER_S as f64 {
+                    self.tally();
+                    self.cap = None;
+                    self.paused_until = Some(Instant::now() + HDR_RETRY);
+                    store.event(now_ns(), "relay_header_paused", &format!("{rate:.0} pkt/s"))?;
+                }
+            }
+        } else if self.enabled && self.paused_until.is_some_and(|u| Instant::now() >= u) {
+            self.paused_until = None;
+            self.start(store)?;
+        }
+        Ok(())
+    }
+
+    fn tally(&mut self) {
+        if let Some(c) = &self.cap {
+            self.events += c.events.load(Ordering::Relaxed);
+            self.wrapped += c.wrapped.load(Ordering::Relaxed);
+        }
+    }
+
+    fn status(&self) -> &'static str {
+        match (self.enabled, &self.cap, self.paused_until) {
+            (false, _, _) => "off",
+            (true, Some(_), _) => "on",
+            (true, None, Some(_)) => "paused (heavy traffic)",
+            (true, None, None) => "starting",
+        }
+    }
+
+    fn finish(&mut self, store: &Store) -> Result<()> {
+        self.tally();
+        if self.enabled || self.events > 0 {
+            store.event(
+                now_ns(),
+                "relay_header_diag",
+                &format!("packets={} wrapped={}", self.events, self.wrapped),
+            )?;
+        }
+        Ok(())
+    }
+}
+
+/// Inbound stream rate above which a mostly-inbound, non-Valve steam.exe
+/// endpoint counts as a player's direct stream (DS3 sends ~12–30 a second).
+const DIRECT_MIN_PPS: f64 = relay::GAME_IN_PPS;
+/// Outbound rate below which the stream counts as one-way. Steam still sends
+/// its connectivity checks to the player's address, ~2 a second (Run 1b
+/// capture: 1.9–2.1 pps, never answered as checks), while a two-way direct
+/// session sends 25–55.
+const DIRECT_MAX_OUT_PPS: f64 = 5.0;
+
+/// Whether a steam.exe endpoint looks like a relayed player's direct
+/// stream: a public, non-relay address sending at game rate while this PC
+/// sends (almost) nothing back to it.
+/// Players send from ephemeral or Steam ports, never from a well-known
+/// service port (a web server on 443, say).
+fn direct_stream(ep: &SocketAddrV4, pps_in: f64, pps_out: f64, is_relay: bool) -> bool {
+    !is_relay
+        && ep.port() >= 1024
+        && !geo::is_non_public(IpAddr::V4(*ep.ip()))
+        && pps_in >= DIRECT_MIN_PPS
+        && pps_out < DIRECT_MAX_OUT_PPS
+}
+
+/// A stream counts as a new sighting only if it reaches game rate soon
+/// after its first packet: an endpoint that trickled for minutes and then
+/// sped up says nothing about when a relay episode started.
+const DIRECT_FRESH_NS: i128 = 15_000_000_000;
+
+#[allow(clippy::too_many_arguments)]
+/// The player-address step, after the relay step (rules in `playerip.rs`):
+/// note relay episode starts and Steam-reported player addresses, collect
+/// direct streams from steam.exe's unclaimed endpoints, link, and log each
+/// new sighting (`player_seen`) and link (`player_link`, event
+/// `player_linked`).
+fn update_players(
+    active: &[(SteamId, P2PState)],
+    peers: &mut HashMap<SteamId, PeerView>,
+    players: &mut playerip::Matcher,
+    side: &SteamSide,
+    ctx: &RelayCtx<'_>,
+    store: &Store,
+    t: i128,
+) -> Result<()> {
+    let det = ctx.detectors;
+    let relay_ip = |ip: Ipv4Addr| {
+        valve::is_relay_address(ip)
+            || ctx.asn.is_some_and(|db| {
+                db.lookup(IpAddr::V4(ip))
+                    .is_some_and(|(n, _)| n == VALVE_ASN)
+            })
+    };
+    for (id, st) in active {
+        let Some(v) = peers.get_mut(id) else { continue };
+        if v.evidence.relayed(&det) {
+            if v.relay_remote != st.remote {
+                players.relay_start(*id, t);
+                v.relay_remote = st.remote;
+            }
+        } else {
+            v.relay_remote = None;
+        }
+        if let Some(r) = st.remote
+            && !v.evidence.remote_is_relay(&det)
+            && !relay_ip(*r.ip())
+            && !geo::is_non_public(IpAddr::V4(*r.ip()))
+        {
+            players.steam_reported(*id, *r.ip());
+        }
+    }
+    for (ep, tr) in &side.traffic {
+        if tr.first_in_ns == 0 || t - tr.first_in_ns > DIRECT_FRESH_NS {
+            continue;
+        }
+        let (pin, pout) = (tr.rate_in.rate(t), tr.rate_out.rate(t));
+        if !direct_stream(ep, pin, pout, relay_ip(*ep.ip())) {
+            continue;
+        }
+        let s = Sighting {
+            ep: *ep,
+            t_ns: tr.first_in_ns,
+            source: Source::Direct,
+        };
+        if players.sighting(s) {
+            store.insert_player_seen(s.t_ns, s.ep, Source::Direct.as_str())?;
+        }
+    }
+    for (id, l) in players.resolve(t) {
+        store.insert_player_link(t, id, l.ip, l.source.as_str(), l.by_timing)?;
+        store.event(
+            t,
+            "player_linked",
+            &format!(
+                "{id} source={} timing={}",
+                l.source.as_str(),
+                u8::from(l.by_timing)
+            ),
+        )?;
+    }
+    for (id, v) in peers.iter_mut() {
+        v.player_link = players.link(*id);
+        v.player_ep = if v.evidence.remote_is_relay(&det) {
+            players.direct_endpoint(*id)
+        } else {
+            None
+        };
+    }
     Ok(())
 }
 
@@ -1291,6 +1563,8 @@ fn drain_etw(
                 tr.saw_reply |= d.size == sizes.1;
                 if tr.last_in_ns != 0 {
                     tr.max_gap_in_ns = tr.max_gap_in_ns.max(d.t_ns - tr.last_in_ns);
+                } else {
+                    tr.first_in_ns = d.t_ns;
                 }
                 tr.last_in_ns = d.t_ns;
             }
@@ -1518,6 +1792,27 @@ fn relay_label(r: &RelayGeo) -> String {
     }
 }
 
+/// How the player's own address was found, for the relay details. The
+/// address itself only in the developer build.
+fn player_line(v: &PeerView) -> String {
+    let Some(l) = v.player_link else {
+        return "not linked yet".into();
+    };
+    let how = match l.source {
+        Source::Steam => "reported by Steam",
+        Source::Direct => "from the player's direct inbound stream (timing)",
+        Source::Wrapper => "from the relay header (timing)",
+    };
+    if SHOW_IPS {
+        let ep = v
+            .player_ep
+            .map_or_else(|| l.ip.to_string(), |e| e.to_string());
+        format!("{ep}, {how}")
+    } else {
+        format!("linked, {how}")
+    }
+}
+
 /// Cut a label to `w` characters for a fixed-width column.
 fn trunc(s: &str, w: usize) -> String {
     s.chars().take(w).collect()
@@ -1545,12 +1840,15 @@ fn draw(
     ctx: &RelayCtx<'_>,
     etw_on: bool,
     tcp: Option<&TcpPaths>,
+    relay_header: &str,
 ) {
     let det = &ctx.detectors;
     let t_now = now_ns();
     let mut out = String::new();
     out.push_str("\x1b[2J\x1b[H");
-    out.push_str("DS3SessionManager - passive monitor (Ctrl+C to stop)\n");
+    out.push_str(&format!(
+        "DS3SessionManager - passive monitor (Ctrl+C to stop); relay header reading: {relay_header}\n"
+    ));
     out.push_str(&format!(
         "RTT/jit/pps/nrep = {} (ETW); player/relay_loc/km/bound/infl = {} (GeoIP); '-' = {}\n\
          sd/ipdv = RTT variation; jit = RFC 3550 jitter of the player's 12 Hz inbound stream (ms)\n\
@@ -1726,7 +2024,7 @@ fn draw(
         .any(|(_, v)| v.geo.is_none() && v.relay_geo.is_some())
     {
         out.push_str(
-            "player '-' on a relayed row: Steam gave a relay address, not the player's, so their own location is unknown\n",
+            "player '-' on a relayed row: Steam gave a relay address, and the player's own address isn't linked yet\n",
         );
     }
 
@@ -1770,6 +2068,7 @@ fn draw(
             "\nRelay for {name}: {rip} ({place}); evidence {}\n",
             v.evidence.log_detail()
         ));
+        out.push_str(&format!("  player address: {}\n", player_line(v)));
         out.push_str(&format!(
             "  {:<21} {:<8} {:<5} {:>6} {:>6} {:>9} {:>9} {:>11} {:>11}\n",
             "endpoint",
@@ -1896,6 +2195,25 @@ fn draw(
 mod tests {
     use super::*;
     use std::net::Ipv4Addr;
+
+    /// Run 1b: a relayed player's own stream arrives at ~30 pps while this PC
+    /// sends only Steam's ~2 checks a second back; a two-way session, a LAN
+    /// address, a relay or a web server on 443 is not such a stream.
+    #[test]
+    fn direct_stream_is_one_way_game_rate_from_a_public_player_port() {
+        let player = SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 20), 53559);
+        assert!(direct_stream(&player, 31.0, 2.1, false));
+        assert!(
+            !direct_stream(&player, 31.0, 30.0, false),
+            "two-way: a direct peer"
+        );
+        assert!(!direct_stream(&player, 3.0, 0.0, false), "below game rate");
+        assert!(!direct_stream(&player, 31.0, 2.1, true), "a relay address");
+        let lan = SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 14), 53559);
+        assert!(!direct_stream(&lan, 31.0, 0.0, false));
+        let web = SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 20), 443);
+        assert!(!direct_stream(&web, 31.0, 0.0, false));
+    }
 
     #[test]
     fn player_addresses_only_in_the_developer_build() {

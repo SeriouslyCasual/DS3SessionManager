@@ -27,6 +27,11 @@
 //! | `traffic`   | endpoint every 5 s (rates, gaps, jitter)       |
 //! | `tcp_seg`   | steam.exe TCP segment to a peer (TCP fallback) |
 //! | `tcp_estats`| TCP fallback connection stats per poll (TCP fallback)|
+//! | `player_seen`| new address that may be a relayed player's (`playerip.rs`)|
+//! | `player_link`| player linked to its own address, and how       |
+//!
+//! `player_seen` and `player_link` hold other players' addresses and are
+//! never exported.
 
 use crate::anon;
 use crate::model::{P2PState, RttSample, SteamId};
@@ -135,6 +140,19 @@ CREATE TABLE IF NOT EXISTS traffic (
     stun_req INTEGER,
     stun_matched INTEGER,
     stun_lost INTEGER
+);
+CREATE TABLE IF NOT EXISTS player_seen (
+    t_ns INTEGER NOT NULL,
+    ip TEXT NOT NULL,
+    port INTEGER NOT NULL,
+    source TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS player_link (
+    t_ns INTEGER NOT NULL,
+    steam_id INTEGER NOT NULL,
+    ip TEXT NOT NULL,
+    source TEXT NOT NULL,
+    by_timing INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS traffic_by_ep ON traffic (remote_ip, remote_port, t_ns);
 CREATE INDEX IF NOT EXISTS rtt_by_peer ON rtt (steam_id, t_ns);
@@ -399,6 +417,37 @@ impl Store {
                 subject.as_str(),
                 g.site,
             ],
+        )?;
+        Ok(())
+    }
+
+    /// A new address that may be a relayed player's (`playerip.rs`);
+    /// `t_ns` is when its first packet arrived.
+    pub fn insert_player_seen(
+        &self,
+        t_ns: i128,
+        ep: std::net::SocketAddrV4,
+        source: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO player_seen VALUES (?1, ?2, ?3, ?4)",
+            params![t_ns as i64, ep.ip().to_string(), ep.port(), source],
+        )?;
+        Ok(())
+    }
+
+    /// A player linked to its own address (`playerip.rs`).
+    pub fn insert_player_link(
+        &self,
+        t_ns: i128,
+        id: SteamId,
+        ip: Ipv4Addr,
+        source: &str,
+        by_timing: bool,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO player_link VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![t_ns as i64, id.0 as i64, ip.to_string(), source, by_timing],
         )?;
         Ok(())
     }

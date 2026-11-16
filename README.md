@@ -28,6 +28,7 @@ DS3SessionManager is a free Windows tool that runs alongside Dark Souls III. For
 ## Is it safe to use?
 
 - The monitor is **read-only**. It never modifies the game. It asks your Steam client which players you're connected to, and it reads Windows' own network statistics to time packets.
+- To place relayed players, it also reads one small header on packets that come from a Steam relay server (the part that says which player the packet is from), using Windows' built-in packet capture. It never reads the game's own data. Turn this off with `--no-relay-header`.
 - It doesn't inject anything into the game and doesn't change game files or memory.
 - Any future feature that does more will be **off by default**, clearly labelled, and only released after thorough testing.
 
@@ -85,7 +86,7 @@ The program is `target\release\ds3sm.exe`. The build places the required `steam_
 | `jit` | Jitter of the game data arriving from that player (ms, RFC 3550). The other player's game sends a packet about 12 times a second; this shows how unevenly they arrive. Well below 1 ms on a home network, a few ms through a relay. It's updated with every packet, so it reacts much faster than the ping columns. |
 | `nrep%` | Share of Steam's connection checks that got no reply: a loss estimate |
 | `pps_in` / `pps_out` | Packets per second to and from that player (all relay connections included) |
-| `player` | The player's own rough location: country and province/state (e.g. `CA-BC`). `-` for a relayed player when Steam only gives the relay's address. |
+| `player` | The player's own rough location: country and province/state (e.g. `CA-BC`). For a relayed player, Steam only gives the relay's address, so ds3sm finds the player's own address from their traffic (see below). `-` until it has. |
 | `relay_loc` | The Steam relay in use: its site code and city (e.g. `sea Seattle`). `-` for a direct connection. |
 | `km` | Estimated distance to the player (needs `--home-lat`/`--home-lon`). |
 | `bound` | Fastest physically possible ping for that distance |
@@ -93,7 +94,12 @@ The program is `target\release\ds3sm.exe`. The build places the required `steam_
 
 `-` means "not available for this connection". The tool never guesses.
 
-For a relayed player, a **Relay for …** section below the table lists each relay connection: its role, the relay site, packets per second, data sent and received, and an estimate of the game data with the relay's own headers removed.
+For a relayed player, a **Relay for …** section below the table lists each relay connection: its role, the relay site, packets per second, data sent and received, and an estimate of the game data with the relay's own headers removed. Its `player address` line says whether the player's own address has been found, and how:
+
+- **direct inbound stream**: often only *your* traffic goes through the relay, while the other player's game sends straight to your PC. ds3sm sees that stream arrive.
+- **relay header**: the relay's header on each packet names the player it came from.
+
+Neither carries a player ID, so ds3sm matches them to players by timing: the address appears within a few seconds of the player's relay connection starting. It only links an address when exactly one player fits, and it waits about 20 seconds before deciding. An address Steam itself reports for a player always wins. The address is used only to look up the player's rough location; it's never shown.
 
 Steam doesn't always say when it relays a connection, so ds3sm treats a player as relayed if any of the signs in `via` appear. To choose which signs count, use for example `--relay-detect F,L`. All four are always recorded in the session log.
 
@@ -106,6 +112,8 @@ Steam doesn't always say when it relays a connection, so ds3sm treats a player a
 | Steam says the game is already running | Close `ds3sm` before starting the game. Always start the game first. |
 | No players listed | You need to be in a multiplayer session (summoned, summoning or invaded). |
 | Ping column empty | Run `probe` and include its output when you report the issue. |
+| `relay header reading: paused (heavy traffic)` | Your PC is receiving a lot of data (a download, say). Reading relay headers pauses to keep the cost low and tries again two minutes later. |
+| `relay header reading: off` with a note at startup | Windows' packet capture couldn't start. Everything else works; relayed players are then placed from their direct stream only. |
 
 ## Credits
 

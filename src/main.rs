@@ -32,8 +32,10 @@
 mod anon; // anonymization helpers for exported data
 mod geo; // distance, speed-of-light bound, GeoIP lookups
 mod geocmp; // `geo-compare`: two GeoIP databases side by side
+mod gturn; // the relay wrapper's header (names a relayed player's address)
 mod jitter; // RFC 3550 jitter on a peer's periodic packet stream
 mod model; // shared data types (SteamId, P2PState, ...)
+mod playerip; // links relayed players to their own public addresses
 mod relay; // detects relayed sessions and which relay endpoints carry them
 mod stats; // rolling median / p95 / jitter
 mod store; // SQLite logging and CSV export
@@ -50,6 +52,8 @@ mod estats; // Windows' per-connection TCP statistics (RTT on the TCP fallback)
 mod etw; // kernel packet tracing (Event Tracing for Windows)
 #[cfg(windows)]
 mod monitor; // the `probe` and `monitor` commands (main loop)
+#[cfg(windows)]
+mod ndiscap; // reads relay wrapper headers from received packets
 #[cfg(windows)]
 mod steam; // talks to the local Steam client
 #[cfg(windows)]
@@ -129,6 +133,13 @@ pub struct MonitorArgs {
     /// RTT, jitter and resends from it, marked `tcp` (validated in E3-T5).
     #[arg(long)]
     pub no_tcp: bool,
+    /// Don't read relay wrapper headers. By default ds3sm reads, from
+    /// packets sent by a Steam relay only, the header that names the relayed
+    /// player's address (never the game data), to place that player. Uses
+    /// Windows' built-in packet capture; paused automatically under heavy
+    /// traffic.
+    #[arg(long)]
+    pub no_relay_header: bool,
     /// Free-text label stored with the run (e.g. what you were testing).
     #[arg(long, default_value = "")]
     pub label: String,
