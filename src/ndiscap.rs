@@ -323,6 +323,72 @@ pub fn self_test() -> Result<()> {
         };
         println!("{line}");
     }
+    // Packet Monitor's provider (needs `pktmon start --capture` running):
+    // events, event IDs, and how many carry a decodable UDP frame in their
+    // `Payload` field.
+    let pktmon = (|| -> Result<String> {
+        let ids: Arc<std::sync::Mutex<HashMap<u16, u64>>> = Arc::default();
+        let frames = Arc::new(AtomicU64::new(0));
+        let fields = Arc::new(std::sync::Mutex::new(None::<String>));
+        let (i2, f2, fl2) = (Arc::clone(&ids), Arc::clone(&frames), Arc::clone(&fields));
+        let provider = Provider::by_guid(PKTMON_PROVIDER)
+            .any(u64::MAX)
+            .level(5)
+            .add_callback(move |r: &EventRecord, loc: &SchemaLocator| {
+                if let Ok(mut m) = i2.lock() {
+                    *m.entry(r.event_id()).or_default() += 1;
+                }
+                let Ok(schema) = loc.event_schema(r) else {
+                    return;
+                };
+                let p = Parser::create(r, &schema);
+                if let Ok(f) = p.try_parse::<Vec<u8>>("Payload") {
+                    if gturn::frame_udp(&f).is_some() {
+                        f2.fetch_add(1, Ordering::Relaxed);
+                    }
+                    if let Ok(mut g) = fl2.lock()
+                        && g.is_none()
+                    {
+                        *g = Some(format!("event {} payload {} B", r.event_id(), f.len()));
+                    }
+                }
+            })
+            .build();
+        let _trace = UserTrace::new()
+            .named(format!("ds3sm-pktmon-{}", std::process::id()))
+            .enable(provider)
+            .start_and_process()
+            .map_err(|e| anyhow!("{e:?}"))?;
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(TEST_SECS);
+        while std::time::Instant::now() < end {
+            let _ = sock.send_to(&[0u8; 37], target);
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let mut top: Vec<(u16, u64)> = ids
+            .lock()
+            .map(|m| m.clone().into_iter().collect())
+            .unwrap_or_default();
+        top.sort_by_key(|a| std::cmp::Reverse(a.1));
+        top.truncate(4);
+        let total: u64 = ids.lock().map(|m| m.values().sum()).unwrap_or(0);
+        Ok(format!(
+            "{:<48} {:>10} {:>14}   ids {:?}; first {}",
+            "Packet Monitor provider (pktmon running?)",
+            total,
+            frames.load(Ordering::Relaxed),
+            top,
+            fields
+                .lock()
+                .ok()
+                .and_then(|g| g.clone())
+                .unwrap_or_else(|| "-".into())
+        ))
+    })();
+    match pktmon {
+        Ok(s) => println!("{s}"),
+        Err(e) => println!("{:<48} failed: {e:#}", "Packet Monitor provider"),
+    }
+
     // Control: a built-in provider that always logs network events. If it
     // counts events while the capture provider counts none, this program's
     // event session works and the capture provider needs switching on.
@@ -361,6 +427,8 @@ pub fn self_test() -> Result<()> {
 }
 
 const TEST_SECS: u64 = 6;
+/// `Microsoft-Windows-PktMon` (Windows Packet Monitor).
+const PKTMON_PROVIDER: &str = "4d4f80d9-c8bd-4d73-bb5b-19c90402c5ac";
 /// `Microsoft-Windows-TCPIP`, the self-test's control provider.
 const TCPIP_PROVIDER: &str = "2f07e2ee-15db-40f1-90ef-9d7ba282188a";
 
