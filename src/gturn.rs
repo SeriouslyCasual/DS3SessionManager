@@ -66,6 +66,51 @@ pub fn source_address(p: &[u8]) -> Option<SocketAddrV4> {
     (i == p.len() && cookie && data).then_some(src).flatten()
 }
 
+/// Message type of a connectivity check (STUN binding request).
+pub const BINDING_REQUEST: u16 = 0x0001;
+/// Message type of a check's answer (binding success response).
+pub const BINDING_SUCCESS: u16 = 0x0101;
+const ATTR_USERNAME: u16 = 0x0006;
+/// Length of one side's ICE credential (username fragment) in Steam's checks.
+pub const CRED_LEN: usize = 16;
+/// One side's credential for one session.
+pub type Cred = [u8; CRED_LEN];
+
+/// Steam's connectivity checks (the 56-byte requests and 68-byte answers)
+/// carry a 32-byte USERNAME: the **receiver's** 16-byte credential followed
+/// by the **sender's**, as in ICE (RFC 8445, without the colon). This PC uses
+/// a different credential for each player's session, and the same one on
+/// every path of that session: in its checks through the relay (echoed in
+/// the relay's answers) and in the player's own checks sent straight here.
+/// So the credential ties a player's address to the relay endpoint Steam
+/// reports for that player, without any timing (Run 1b capture, 2026-11-15).
+///
+/// Returns the message type and the two halves `(receiver, sender)`, for a
+/// well-formed binding request or success response with such a USERNAME.
+pub fn check_username(p: &[u8]) -> Option<(u16, Cred, Cred)> {
+    let t = be16(p, 0)?;
+    if (t != BINDING_REQUEST && t != BINDING_SUCCESS)
+        || usize::from(be16(p, 2)?) + HEADER != p.len()
+    {
+        return None;
+    }
+    let mut i = HEADER;
+    while i + 4 <= p.len() {
+        let at = be16(p, i)?;
+        let len = usize::from(be16(p, i + 2)?);
+        if at == ATTR_USERNAME && len == 2 * CRED_LEN {
+            let u = p.get(i + 4..i + 4 + 2 * CRED_LEN)?;
+            return Some((
+                t,
+                u[..CRED_LEN].try_into().ok()?,
+                u[CRED_LEN..].try_into().ok()?,
+            ));
+        }
+        i += 4 + ((len + 3) & !3);
+    }
+    None
+}
+
 /// One IPv4 UDP datagram found in a captured frame.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Udp<'a> {
@@ -214,6 +259,41 @@ pub(crate) mod tests {
         q[33] = 2;
         assert_eq!(source_address(&q), None);
         assert_eq!(source_address(&[0u8; 10]), None);
+    }
+
+    /// A 56-byte check (or 68-byte answer, with `extra`) as in the capture:
+    /// classic header, then USERNAME = receiver credential + sender's.
+    pub(crate) fn check(t: u16, receiver: &[u8; 16], sender: &[u8; 16], extra: bool) -> Vec<u8> {
+        let mut user = receiver.to_vec();
+        user.extend_from_slice(sender);
+        let mut body = attr(ATTR_USERNAME, &user, true);
+        if extra {
+            // MAPPED-ADDRESS, as in the answers.
+            body.extend(attr(0x0001, &[0, 1, 0xCC, 0xEB, 198, 51, 100, 7], true));
+        }
+        let mut p = [t.to_be_bytes(), (body.len() as u16).to_be_bytes()].concat();
+        p.extend_from_slice(&[9u8; 16]);
+        p.extend_from_slice(&body);
+        p
+    }
+
+    #[test]
+    fn check_usernames_split_into_receiver_and_sender() {
+        let (me, them) = (*b"TdfXKimqlCIyGP8i", *b"1wACynUc9GzvttMh");
+        let req = check(BINDING_REQUEST, &me, &them, false);
+        assert_eq!(req.len(), 56, "the request size Steam uses");
+        assert_eq!(check_username(&req), Some((BINDING_REQUEST, me, them)));
+        let ans = check(BINDING_SUCCESS, &them, &me, true);
+        assert_eq!(ans.len(), 68, "the answer size Steam uses");
+        assert_eq!(check_username(&ans), Some((BINDING_SUCCESS, them, me)));
+        // Other types, a bad length field, or no USERNAME: nothing.
+        let mut q = req.clone();
+        q[1] = 0x15;
+        assert_eq!(check_username(&q), None);
+        let mut q = req.clone();
+        q[3] ^= 4;
+        assert_eq!(check_username(&q), None);
+        assert_eq!(check_username(&indication(player(), &[1u8; 8])), None);
     }
 
     #[test]

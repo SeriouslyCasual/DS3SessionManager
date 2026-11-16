@@ -403,6 +403,11 @@ struct PeerView {
     /// endpoint its direct inbound stream arrives from, if it comes that way.
     player_link: Option<playerip::Link>,
     player_ep: Option<SocketAddrV4>,
+    /// Another live player reports the same remote (two relayed players on
+    /// one relay endpoint). Then the two sessions' checks on it can't be
+    /// told apart by size and timing, so RTT samples there are kept out of
+    /// both players' statistics (stored without a Steam ID).
+    shared_remote: bool,
 }
 
 /// Steam's TCP fallback connection to a peer, with statistics collection on.
@@ -459,6 +464,17 @@ struct RelayCtx<'a> {
     home: Option<LatLon>,
 }
 
+impl RelayCtx<'_> {
+    /// A relay address: Valve's built-in list, or the ASN database says Valve.
+    fn is_relay_ip(&self, ip: Ipv4Addr) -> bool {
+        valve::is_relay_address(ip)
+            || self.asn.is_some_and(|db| {
+                db.lookup(IpAddr::V4(ip))
+                    .is_some_and(|(n, _)| n == VALVE_ASN)
+            })
+    }
+}
+
 impl PeerView {
     fn new(state: P2PState, window: usize) -> Self {
         Self {
@@ -483,6 +499,7 @@ impl PeerView {
             relay_remote: None,
             player_link: None,
             player_ep: None,
+            shared_remote: false,
         }
     }
 
@@ -690,7 +707,7 @@ pub fn run(args: MonitorArgs) -> Result<()> {
             )?;
         }
         // 1a. Relay wrapper headers.
-        hdr.drain(&mut players, &store)?;
+        hdr.drain(&mut players, &peers, &store)?;
         // 1b. Drain TCP fallback events (on unless `--no-tcp`).
         if let (Some(t), Some(bo), Some(tp)) = (&trace, byte_order, tcp_paths.as_mut()) {
             drain_tcp(t, bo, steam_pid, tp, &by_endpoint, &store)?;
@@ -788,6 +805,23 @@ pub fn run(args: MonitorArgs) -> Result<()> {
                 view.unseen_logged = false;
                 view.on_tcp = false;
                 view.tcp_conn = None;
+            }
+        }
+
+        // 3b. Two live players on one relay endpoint (see `shared_remote`).
+        for (id, st) in &active {
+            let shared = st.remote.is_some_and(|r| reporters(&peers, r).len() > 1);
+            if let Some(v) = peers.get_mut(id)
+                && v.shared_remote != shared
+            {
+                v.shared_remote = shared;
+                let kind = if shared {
+                    "remote_shared"
+                } else {
+                    "remote_shared_end"
+                };
+                let remote = st.remote.map_or("-".into(), |r| r.to_string());
+                store.event(t, kind, &format!("{id} {remote}"))?;
             }
         }
 
@@ -979,17 +1013,39 @@ impl RelayHeader {
         Ok(())
     }
 
-    /// Feed wrapped addresses to the matcher.
-    fn drain(&mut self, players: &mut playerip::Matcher, store: &Store) -> Result<()> {
+    /// Feed what the packets told to the matcher. A relay's answer names a
+    /// session's credential; it is tied to a player only when exactly one
+    /// live player reports that relay endpoint (two players can share one
+    /// relay endpoint, `IP:4379`).
+    fn drain(
+        &mut self,
+        players: &mut playerip::Matcher,
+        peers: &HashMap<SteamId, PeerView>,
+        store: &Store,
+    ) -> Result<()> {
         let Some(c) = &self.cap else { return Ok(()) };
-        while let Ok(w) = c.rx.try_recv() {
-            let s = Sighting {
-                ep: w.player,
-                t_ns: w.t_ns,
-                source: Source::Wrapper,
-            };
-            if players.sighting(s) {
-                store.insert_player_seen(s.t_ns, s.ep, Source::Wrapper.as_str())?;
+        while let Ok(seen) = c.rx.try_recv() {
+            match seen {
+                ndiscap::Seen::Wrapped { t_ns, player } => {
+                    let s = Sighting {
+                        ep: player,
+                        t_ns,
+                        source: Source::Wrapper,
+                    };
+                    if players.sighting(s) {
+                        store.insert_player_seen(t_ns, player, Source::Wrapper.as_str())?;
+                    }
+                }
+                ndiscap::Seen::RelayCred { relay, cred } => {
+                    if let [id] = reporters(peers, relay)[..] {
+                        players.relay_credential(id, cred);
+                    }
+                }
+                ndiscap::Seen::PlayerCred { t_ns, player, cred } => {
+                    if players.player_credential(player, cred, t_ns) {
+                        store.insert_player_seen(t_ns, player, Source::Credential.as_str())?;
+                    }
+                }
             }
         }
         Ok(())
@@ -1046,6 +1102,16 @@ impl RelayHeader {
     }
 }
 
+/// The live players Steam currently reports `ep` for. Usually one; two when
+/// both are relayed through the same relay endpoint.
+fn reporters(peers: &HashMap<SteamId, PeerView>, ep: SocketAddrV4) -> Vec<SteamId> {
+    peers
+        .iter()
+        .filter(|(_, v)| (v.state.active || v.state.connecting) && v.state.remote == Some(ep))
+        .map(|(id, _)| *id)
+        .collect()
+}
+
 /// Inbound stream rate above which a mostly-inbound, non-Valve steam.exe
 /// endpoint counts as a player's direct stream (DS3 sends ~12–30 a second).
 const DIRECT_MIN_PPS: f64 = relay::GAME_IN_PPS;
@@ -1089,13 +1155,7 @@ fn update_players(
     t: i128,
 ) -> Result<()> {
     let det = ctx.detectors;
-    let relay_ip = |ip: Ipv4Addr| {
-        valve::is_relay_address(ip)
-            || ctx.asn.is_some_and(|db| {
-                db.lookup(IpAddr::V4(ip))
-                    .is_some_and(|(n, _)| n == VALVE_ASN)
-            })
-    };
+    let relay_ip = |ip: Ipv4Addr| ctx.is_relay_ip(ip);
     for (id, st) in active {
         let Some(v) = peers.get_mut(id) else { continue };
         if v.evidence.relayed(&det) {
@@ -1111,7 +1171,7 @@ fn update_players(
             && !relay_ip(*r.ip())
             && !geo::is_non_public(IpAddr::V4(*r.ip()))
         {
-            players.steam_reported(*id, *r.ip());
+            players.steam_reported(*id, *r.ip(), t);
         }
     }
     for (ep, tr) in &side.traffic {
@@ -1132,14 +1192,15 @@ fn update_players(
         }
     }
     for (id, l) in players.resolve(t) {
-        store.insert_player_link(t, id, l.ip, l.source.as_str(), l.by_timing)?;
+        let timing = !l.source.exact();
+        store.insert_player_link(t, id, l.ip, l.source.as_str(), timing)?;
         store.event(
             t,
             "player_linked",
             &format!(
                 "{id} source={} timing={}",
                 l.source.as_str(),
-                u8::from(l.by_timing)
+                u8::from(timing)
             ),
         )?;
     }
@@ -1213,14 +1274,7 @@ fn update_relays(
         keys.extend(v.relay_eps.iter().copied());
     }
     keys.extend(all_reported.iter().copied());
-    // A relay address: built-in list, or the ASN database says Valve.
-    let relay_addr = |ip: Ipv4Addr| {
-        valve::is_relay_address(ip)
-            || ctx.asn.is_some_and(|db| {
-                db.lookup(IpAddr::V4(ip))
-                    .is_some_and(|(n, _)| n == VALVE_ASN)
-            })
-    };
+    let relay_addr = |ip: Ipv4Addr| ctx.is_relay_ip(ip);
     let candidates: Vec<relay::Candidate> = keys
         .iter()
         .map(|&ep| {
@@ -1576,7 +1630,11 @@ fn drain_etw(
                 source: RttSource::EtwStun,
             };
             let id = if counted {
-                by_endpoint.get(&m.remote).copied()
+                by_endpoint.get(&m.remote).copied().filter(|id| {
+                    !peers
+                        .get(id)
+                        .is_some_and(|v| v.shared_remote && v.state.remote == Some(m.remote))
+                })
             } else {
                 None
             };
@@ -1800,6 +1858,7 @@ fn player_line(v: &PeerView) -> String {
     };
     let how = match l.source {
         Source::Steam => "reported by Steam",
+        Source::Credential => "from the player's own checks for this session (exact)",
         Source::Direct => "from the player's direct inbound stream (timing)",
         Source::Wrapper => "from the relay header (timing)",
     };
@@ -1917,7 +1976,7 @@ fn draw(
             (true, false) => "yes",
             _ => "no",
         };
-        let noreply = stun_ep.and_then(|r| {
+        let noreply = stun_ep.filter(|_| !v.shared_remote).and_then(|r| {
             let c = matcher.counters(&r);
             (c.requests > 0)
                 .then(|| 100.0 * (c.requests.saturating_sub(c.matched)) as f64 / c.requests as f64)
@@ -2026,6 +2085,13 @@ fn draw(
         out.push_str(
             "player '-' on a relayed row: Steam gave a relay address, and the player's own address isn't linked yet\n",
         );
+    }
+    for (_, v) in shown.iter().filter(|(_, v)| v.shared_remote) {
+        let name = v.persona.clone().unwrap_or_else(|| "?".into());
+        out.push_str(&format!(
+            "shared relay: {name} uses the same relay endpoint as another player; their checks can't be told apart there, \
+             so new ping samples and nrep% are held back until that ends\n"
+        ));
     }
 
     // Relay details: the relay server and every endpoint counted for the peer.

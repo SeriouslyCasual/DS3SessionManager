@@ -28,7 +28,7 @@ DS3SessionManager is a free Windows tool that runs alongside Dark Souls III. For
 ## Is it safe to use?
 
 - The monitor is **read-only**. It never modifies the game. It asks your Steam client which players you're connected to, and it reads Windows' own network statistics to time packets.
-- To place relayed players, it also reads one small header on packets that come from a Steam relay server (the part that says which player the packet is from), using Windows' built-in packet capture. It never reads the game's own data. Turn this off with `--no-relay-header`.
+- To place relayed players, it also reads a little connection information from received packets, using Windows' built-in packet capture: the header a Steam relay server adds (which says which player the packet is from), and the session ID inside Steam's connection checks. It never reads the game's own data. Turn this off with `--no-relay-header`.
 - It doesn't inject anything into the game and doesn't change game files or memory.
 - Any future feature that does more will be **off by default**, clearly labelled, and only released after thorough testing.
 
@@ -96,10 +96,13 @@ The program is `target\release\ds3sm.exe`. The build places the required `steam_
 
 For a relayed player, a **Relay for …** section below the table lists each relay connection: its role, the relay site, packets per second, data sent and received, and an estimate of the game data with the relay's own headers removed. Its `player address` line says whether the player's own address has been found, and how:
 
-- **direct inbound stream**: often only *your* traffic goes through the relay, while the other player's game sends straight to your PC. ds3sm sees that stream arrive.
-- **relay header**: the relay's header on each packet names the player it came from.
+- **reported by Steam**: the player was on a direct connection at some point, so Steam gave their address.
+- **the player's own checks for this session (exact)**: often only *your* traffic goes through the relay, while the other player's game sends straight to your PC, together with Steam's connection checks. Those checks carry the same session ID as the checks on the relay connection Steam reports for that player, so the address is matched to the right player exactly.
+- **the relay header** or **direct inbound stream (timing)**: for players whose packets only arrive through a relay, the relay's header names the player, but nothing ties it to a session. ds3sm then matches by timing: the address appears within a few seconds of that player's relay connection starting. It only links when exactly one player fits, and waits about 20 seconds before deciding. An exact match always replaces a timing match.
 
-Neither carries a player ID, so ds3sm matches them to players by timing: the address appears within a few seconds of the player's relay connection starting. It only links an address when exactly one player fits, and it waits about 20 seconds before deciding. An address Steam itself reports for a player always wins. The address is used only to look up the player's rough location; it's never shown.
+The address is used only to look up the player's rough location; it's never shown.
+
+If two players happen to use the same relay connection, their ping checks can't be told apart there, so ds3sm holds back new ping samples for both until that ends (a `shared relay` note says so).
 
 Steam doesn't always say when it relays a connection, so ds3sm treats a player as relayed if any of the signs in `via` appear. To choose which signs count, use for example `--relay-detect F,L`. All four are always recorded in the session log.
 
