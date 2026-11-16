@@ -95,13 +95,14 @@ pub fn probe(geo_path: &Path, asn_path: &Path) -> Result<()> {
             );
             for (id, st) in peers {
                 println!(
-                    "    {id}  name={:?} active={} connecting={} relay={} err={} remote={:?}",
+                    "    {id}  name={:?} active={} connecting={} relay={} err={} remote={}",
                     s.persona(id),
                     st.active,
                     st.connecting,
                     st.using_relay,
                     st.error,
                     st.remote
+                        .map_or("-".into(), |r| show_ep(r, valve::is_relay_address(*r.ip())))
                 );
                 // Relay detectors L and A on Steam's reported remote (P
                 // needs traffic, so only `monitor` evaluates it).
@@ -196,6 +197,7 @@ fn peer_traffic_by_process(
         for ((pid, remote), (out, inn, mut sizes)) in rows.into_iter().take(limit) {
             sizes.sort_unstable();
             let name = names.get(&pid).map(String::as_str).unwrap_or("?");
+            let remote = show_ep(remote, valve::is_relay_address(*remote.ip()));
             println!("    {name} (pid {pid}) <-> {remote}: out {out}, in {inn}, sizes {sizes:?}");
         }
     };
@@ -337,6 +339,21 @@ fn peer_jitter(
         })
         .max_by(|a, b| a.0.total_cmp(&b.0))
         .and_then(|(_, j)| j.jitter_ms())
+}
+
+/// Whether this build shows other players' IP addresses (and city-level
+/// locations): only the developer build (`--features dev`).
+pub const SHOW_IPS: bool = cfg!(feature = "dev");
+
+/// An endpoint for display: relay addresses are Valve's and always shown;
+/// anything else may be a player's address, shown only in the developer
+/// build.
+fn show_ep(ep: SocketAddrV4, is_relay: bool) -> String {
+    if SHOW_IPS || is_relay {
+        ep.to_string()
+    } else {
+        "(hidden)".into()
+    }
 }
 
 /// Everything the monitor remembers about one peer between polls.
@@ -547,6 +564,11 @@ pub fn run(args: MonitorArgs) -> Result<()> {
     };
     store.set_meta("relay_detect", &args.relay_detect.to_string())?;
     store.set_meta("asn_db", if asndb.is_some() { "yes" } else { "no" })?;
+    if geodb.is_some()
+        && let Some(f) = args.geo.file_name()
+    {
+        store.set_meta("geo_db", &f.to_string_lossy())?;
+    }
     let ctx = RelayCtx {
         detectors: args.relay_detect,
         asn: asndb.as_ref(),
@@ -1485,6 +1507,22 @@ fn opt(v: Option<f64>, prec: usize) -> String {
         .unwrap_or_else(|| "-".into())
 }
 
+/// The relay's place: Valve's site code and city (e.g. `sea Seattle`), else
+/// the GeoIP country and city. A relay is Valve's server, so its city is
+/// shown in every build.
+fn relay_label(r: &RelayGeo) -> String {
+    match (r.site, &r.geo) {
+        (Some(p), _) => format!("{} {}", p.code, p.desc.split(" (").next().unwrap_or(p.desc)),
+        (None, Some(g)) => format!("? {}", geo::place_label(g, true)),
+        (None, None) => "?".into(),
+    }
+}
+
+/// Cut a label to `w` characters for a fixed-width column.
+fn trunc(s: &str, w: usize) -> String {
+    s.chars().take(w).collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 /// Redraw the live table.
 ///
@@ -1495,7 +1533,8 @@ fn opt(v: Option<f64>, prec: usize) -> String {
 /// Below the peer table it lists, for relayed peers, the relay server and
 /// each relay endpoint; then "unattributed" endpoints: addresses the game
 /// exchanges packets with that no Steam session claims (matchmaking servers,
-/// or peers missing from the coplay list).
+/// or peers missing from the coplay list). Players' addresses appear only in
+/// the developer build (`SHOW_IPS`).
 fn draw(
     peers: &HashMap<SteamId, PeerView>,
     current: &[SteamId],
@@ -1513,16 +1552,23 @@ fn draw(
     out.push_str("\x1b[2J\x1b[H");
     out.push_str("DS3SessionManager - passive monitor (Ctrl+C to stop)\n");
     out.push_str(&format!(
-        "RTT/jit/pps/nrep = {} (ETW); cc/km/bound/infl = {} (GeoIP); '-' = {}\n\
-         sd/ipdv = RTT variation; jit = RFC 3550 jitter of the player's 12 Hz inbound stream (ms)\n\n",
+        "RTT/jit/pps/nrep = {} (ETW); player/relay_loc/km/bound/infl = {} (GeoIP); '-' = {}\n\
+         sd/ipdv = RTT variation; jit = RFC 3550 jitter of the player's 12 Hz inbound stream (ms)\n\
+         player = the player's own rough location; relay_loc = the Valve relay in use; km/bound/infl are to the player\n\n",
         Provenance::Measured.as_str(),
         Provenance::Estimated.as_str(),
         Provenance::Unknown.as_str()
     ));
+    let remote_head = if SHOW_IPS {
+        format!("{:<21} ", "remote")
+    } else {
+        String::new()
+    };
+    let loc_w = if SHOW_IPS { 24 } else { 14 };
     out.push_str(&format!(
-        "{:<17} {:<16} {:<3} {:<5} {:<4} {:<21} {:>6} {:>6} {:>6} {:>6} {:>6} {:>5} {:>5} {:>7} {:>7} {:<6} {:>6} {:>6} {:>5}\n",
-        "steam_id", "name", "st", "relay", "via", "remote", "last", "med", "p95", "sd", "ipdv",
-        "jit", "nrep%", "pps_in", "pps_out", "cc", "km", "bound", "infl"
+        "{:<17} {:<16} {:<3} {:<5} {:<4} {remote_head}{:>6} {:>6} {:>6} {:>6} {:>6} {:>5} {:>5} {:>7} {:>7} {:<loc_w$} {:<14} {:>6} {:>6} {:>5}\n",
+        "steam_id", "name", "st", "relay", "via", "last", "med", "p95", "sd", "ipdv",
+        "jit", "nrep%", "pps_in", "pps_out", "player", "relay_loc", "km", "bound", "infl"
     ));
     for id in current {
         let Some(v) = peers.get(id) else { continue };
@@ -1558,9 +1604,14 @@ fn draw(
         } else {
             stun_ep
         };
-        let remote = shown_ep
-            .map(|r| r.to_string())
-            .unwrap_or_else(|| "-".into());
+        let remote = if SHOW_IPS {
+            format!(
+                "{:<21} ",
+                shown_ep.map_or_else(|| "-".into(), |r| r.to_string())
+            )
+        } else {
+            String::new()
+        };
         let relayed = v.evidence.relayed(det);
         let inferred = !v.relay_eps.is_empty() || v.evidence.remote_is_relay(det);
         let relay_col = match (relayed, inferred) {
@@ -1595,23 +1646,15 @@ fn draw(
             ),
             None => (relay_col, opt(noreply, 0), pin, pout, jit),
         };
-        // Geo: the player's if known; otherwise the relay's, marked "R:".
-        let (cc, km, bound) = match (&v.geo, &v.relay_geo) {
-            (Some(g), _) => (
-                g.country.clone().unwrap_or_else(|| "-".into()),
-                v.distance_km,
-                v.bound_ms,
-            ),
-            (None, Some(r)) => {
-                let tag = r
-                    .site
-                    .map(|p| p.code.to_string())
-                    .or_else(|| r.geo.as_ref().and_then(|g| g.country.clone()))
-                    .unwrap_or_else(|| "?".into());
-                (format!("R:{tag}"), r.distance_km, r.bound_ms)
-            }
-            (None, None) => ("-".into(), None, None),
-        };
+        // Two separate places: the player's own (from their public IP; the
+        // country and region in the public build, plus the city in the
+        // developer build) and the Valve relay in use, if any.
+        let player = v
+            .geo
+            .as_ref()
+            .map_or_else(|| "-".into(), |g| geo::place_label(g, SHOW_IPS));
+        let relay_loc = v.relay_geo.as_ref().map_or_else(|| "-".into(), relay_label);
+        let (km, bound) = (v.distance_km, v.bound_ms);
         let infl = match (s, v.bound_ms, &v.geo) {
             (Some(s), Some(b), Some(_)) if b > 0.5 => Some(s.median / b),
             _ => None,
@@ -1624,13 +1667,12 @@ fn draw(
             .take(16)
             .collect();
         out.push_str(&format!(
-            "{:<17} {:<16} {:<3} {:<5} {:<4} {:<21} {:>6} {:>6} {:>6} {:>6} {:>6} {:>5} {:>5} {:>7} {:>7} {:<6} {:>6} {:>6} {:>5}\n",
+            "{:<17} {:<16} {:<3} {:<5} {:<4} {remote}{:>6} {:>6} {:>6} {:>6} {:>6} {:>5} {:>5} {:>7} {:>7} {:<loc_w$} {:<14} {:>6} {:>6} {:>5}\n",
             id.to_string(),
             name,
             st,
             relay_col,
             v.evidence.letters(),
-            remote,
             opt(s.map(|s| s.last), 1),
             opt(s.map(|s| s.median), 1),
             opt(s.map(|s| s.p95), 1),
@@ -1640,7 +1682,8 @@ fn draw(
             loss_col,
             opt(pin, 0),
             opt(pout, 0),
-            cc,
+            trunc(&player, loc_w),
+            trunc(&relay_loc, 14),
             opt(km, 0),
             opt(bound, 1),
             opt(infl, 1),
@@ -1683,7 +1726,7 @@ fn draw(
         .any(|(_, v)| v.geo.is_none() && v.relay_geo.is_some())
     {
         out.push_str(
-            "R:xxx = location of the Valve relay server (site code), NOT the player; km/bound are to the relay\n",
+            "player '-' on a relayed row: Steam gave a relay address, not the player's, so their own location is unknown\n",
         );
     }
 
@@ -1715,7 +1758,11 @@ fn draw(
                         )
                     })
                     .unwrap_or_default();
-                format!("{site}; {g}")
+                let km = match (r.distance_km, r.bound_ms) {
+                    (Some(d), Some(b)) => format!("; {d:.0} km away, bound {b:.1} ms"),
+                    _ => String::new(),
+                };
+                format!("{site}; {g}{km}")
             }
             None => "location unknown".into(),
         };
@@ -1804,7 +1851,7 @@ fn draw(
             let s = side.rtt.get(&ep).and_then(|r| r.summary());
             out.push_str(&format!(
                 "  {:<21} pps in {:>4.0} out {:>4.0}  RTT med {:>6} p95 {:>6}\n",
-                ep.to_string(),
+                show_ep(ep, valve::is_relay_address(*ep.ip())),
                 pin,
                 pout,
                 opt(s.map(|s| s.median), 1),
@@ -1831,7 +1878,7 @@ fn draw(
                     .unwrap_or_default();
                 out.push_str(&format!(
                     "  {:<21} in {:>7} pkts  out {:>7} pkts  max_gap {:>6.0} ms{owner}\n",
-                    ep.to_string(),
+                    show_ep(*ep, valve::is_relay_address(*ep.ip())),
                     t.pkts_in,
                     t.pkts_out,
                     t.max_gap_in_ns as f64 / 1e6
@@ -1849,6 +1896,19 @@ fn draw(
 mod tests {
     use super::*;
     use std::net::Ipv4Addr;
+
+    #[test]
+    fn player_addresses_only_in_the_developer_build() {
+        let player = SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 20), 50704);
+        let relay = SocketAddrV4::new(Ipv4Addr::new(205, 196, 6, 1), 4380);
+        assert_eq!(show_ep(relay, true), relay.to_string());
+        let shown = show_ep(player, false);
+        if cfg!(feature = "dev") {
+            assert_eq!(shown, "198.51.100.20:50704");
+        } else {
+            assert_eq!(shown, "(hidden)");
+        }
+    }
 
     const GAME: u32 = 100;
     const STEAM: u32 = 200;

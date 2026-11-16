@@ -31,6 +31,7 @@
 // any OS. That also lets their unit tests run anywhere.
 mod anon; // anonymization helpers for exported data
 mod geo; // distance, speed-of-light bound, GeoIP lookups
+mod geocmp; // `geo-compare`: two GeoIP databases side by side
 mod jitter; // RFC 3550 jitter on a peer's periodic packet stream
 mod model; // shared data types (SteamId, P2PState, ...)
 mod relay; // detects relayed sessions and which relay endpoints carry them
@@ -175,6 +176,24 @@ enum Cmd {
         #[arg(long, default_value = "run")]
         label: String,
     },
+    /// Compare two GeoIP databases on the players' addresses in a run.
+    GeoCompare {
+        /// Run database to read the players' addresses from.
+        #[arg(long)]
+        db: PathBuf,
+        /// First City database (default: DB-IP City Lite).
+        #[arg(long, default_value = "geo/dbip-city-lite.mmdb")]
+        a: PathBuf,
+        /// Second City database (default: MaxMind GeoLite2 City).
+        #[arg(long, default_value = "geo/GeoLite2-City.mmdb")]
+        b: PathBuf,
+        /// Your own latitude, to show each database's distance.
+        #[arg(long, allow_hyphen_values = true, requires = "home_lon")]
+        home_lat: Option<f64>,
+        /// Your own longitude.
+        #[arg(long, allow_hyphen_values = true, requires = "home_lat")]
+        home_lon: Option<f64>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -217,6 +236,18 @@ fn main() -> Result<()> {
             s.export_anonymized(&out, &salt, &label)?;
             println!("exported anonymized CSVs to {}", out.display());
             Ok(())
+        }
+        Cmd::GeoCompare {
+            db,
+            a,
+            b,
+            home_lat,
+            home_lon,
+        } => {
+            let home = home_lat
+                .zip(home_lon)
+                .map(|(lat, lon)| geo::LatLon { lat, lon });
+            geocmp::run(&db, &a, &b, home, cfg!(feature = "dev"))
         }
         #[cfg(windows)]
         Cmd::Probe { geo, asn } => monitor::probe(&geo, &asn),

@@ -7,6 +7,12 @@ license = "MIT"
 repository = "https://github.com/SeriouslyCasual/DS3SessionManager"
 publish = false
 
+[features]
+# Developer build: shows other players' IP addresses and city-level
+# locations. The public build never displays a player's IP; it uses it only
+# to look up a rough location (country and region).
+dev = []
+
 [dependencies]
 anyhow = "1.0"
 clap = { version = "4.6", features = ["derive"] }

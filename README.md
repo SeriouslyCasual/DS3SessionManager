@@ -14,7 +14,7 @@ DS3SessionManager is a free Windows tool that runs alongside Dark Souls III. For
 - **Jitter**: how much the ping wobbles.
 - **Packet loss estimate.**
 - **Direct vs. Steam relay** connection, detected even when Steam itself doesn't flag the relay. For relayed players it also shows the relay server's location (not the player's) and the traffic on each relay connection.
-- **Region and distance**, estimated from an offline IP-location database. Your peers' IPs are never sent to any website.
+- **Region and distance**, estimated from an offline IP-location database: the player's own rough location (country and province/state) and, separately, the location of the Steam relay in use. Other players' IP addresses are never shown and never sent to any website.
 - **Fastest possible ping** for that distance, and how far above it the real ping is. This is handy for spotting bad routes.
 - Session logging to a local file, plus an anonymized export.
 
@@ -45,6 +45,7 @@ As with any third-party tool: use it at your own risk. This project isn't affili
 - **Run as administrator** for ping measurement. Windows only lets administrators read network timing. Without admin rights, use `--no-etw`: you still see who's connected, but not their ping.
 - Optional, for regions: the free **DB-IP "IP to City Lite"** database (MMDB format) from <https://db-ip.com/db/download/ip-to-city-lite>, saved as `geo/dbip-city-lite.mmdb` next to the program.
 - Optional, for better relay detection and network names: the free **DB-IP "IP to ASN Lite"** database (MMDB format) from <https://db-ip.com/db/download/ip-to-asn-lite>, saved as `geo/dbip-asn-lite.mmdb`.
+- Optional alternative for regions: MaxMind's free **GeoLite2 City** database (needs a free MaxMind account; download the `GeoLite2-City` database in GeoIP2 Binary `.mmdb` format from <https://www.maxmind.com/en/accounts/current/geoip/downloads>), saved as `geo/GeoLite2-City.mmdb`. Use it with `--geo geo/GeoLite2-City.mmdb`. Unlike DB-IP Lite it gives an accuracy radius for each location. `ds3sm geo-compare --db runs\<run>.sqlite` shows how far the two databases' answers are apart for the players in a session.
 
 ## Building from source
 
@@ -79,15 +80,16 @@ The program is `target\release\ds3sm.exe`. The build places the required `steam_
 | `st` | `A` = connected, `C` = connecting. `A!` = Steam says connected, but no game data has reached your PC over UDP for several seconds: the connection has moved somewhere the tool can't follow, so the ping, jitter and loss numbers are out of date. This happens when the connection is very bad. (Steam's TCP fallback is followed automatically and shows as `tcp` under `relay` instead, unless you started with `--no-tcp`.) |
 | `relay` | `no` = direct. `yes*` = going through a Valve relay server, and ds3sm found the relay's connections. `yes` = Steam says it's relayed, but the relay wasn't found. `tcp` = Steam has moved the connection to its **TCP fallback**, a direct TCP link to the player that it uses when normal (UDP) traffic keeps failing. Other players' movement usually looks choppier on this path than on a normal connection with the same ping. The ping columns then show the lowest of Windows' own measurements of that TCP connection over the last 10 seconds, in whole milliseconds (taking the lowest filters out the extra wait when the other PC delays its acknowledgements). Jitter includes TCP's own resend delay, and `nrep%` shows the share of your packets TCP had to send again (marked `r`). |
 | `via` | Which signs of a relay were seen: `F` Steam's own flag, `P` the traffic pattern, `A` the network owner (needs the ASN database), `L` ds3sm's built-in list of Valve relay addresses. `-` = none. |
-| `remote` | The address the ping is measured to: the player, or the relay server |
 | `last` / `med` / `p95` | Latest, typical and worst-case ping in milliseconds. Through a relay, this is the full round trip to the player and back, not just to the relay. |
 | `sd` / `ipdv` | Two measures of how much the ping varies (ms). Lower is smoother. |
 | `jit` | Jitter of the game data arriving from that player (ms, RFC 3550). The other player's game sends a packet about 12 times a second; this shows how unevenly they arrive. Well below 1 ms on a home network, a few ms through a relay. It's updated with every packet, so it reacts much faster than the ping columns. |
 | `nrep%` | Share of Steam's connection checks that got no reply: a loss estimate |
 | `pps_in` / `pps_out` | Packets per second to and from that player (all relay connections included) |
-| `cc` / `km` | Estimated country and distance. `R:fra` (a relay site code, here Frankfurt) means it's the **relay server's** location, not the player's. |
+| `player` | The player's own rough location: country and province/state (e.g. `CA-BC`). `-` for a relayed player when Steam only gives the relay's address. |
+| `relay_loc` | The Steam relay in use: its site code and city (e.g. `sea Seattle`). `-` for a direct connection. |
+| `km` | Estimated distance to the player (needs `--home-lat`/`--home-lon`). |
 | `bound` | Fastest physically possible ping for that distance |
-| `infl` | Actual ping ÷ fastest possible. Around 2–4 is normal; much higher suggests a long route, a relay or a VPN. Left blank when only the relay's location is known. |
+| `infl` | Actual ping ÷ fastest possible. Around 2–4 is normal; much higher suggests a long route, a relay or a VPN. Left blank when the player's own location isn't known. |
 
 `-` means "not available for this connection". The tool never guesses.
 
@@ -109,6 +111,7 @@ Steam doesn't always say when it relays a connection, so ds3sm treats a player a
 
 - Inspired by **DS3ConnectionInfo** and **SteamP2PInfo** by tremwil. Their ideas showed this was possible. No code from them is used.
 - IP geolocation and network data by [DB-IP](https://db-ip.com) (CC BY 4.0).
+- Optional GeoLite2 support: this product includes GeoLite2 data created by MaxMind, available from [maxmind.com](https://www.maxmind.com), when you download and use that database.
 - Valve's address space from [RIPEstat](https://stat.ripe.net), and Steam relay site locations from Steam's public relay network configuration.
 - Developed in part as a networking research project. Research notes and progress logs are on the [project site](https://seriouslycasual.github.io/DS3SessionManager/).
 

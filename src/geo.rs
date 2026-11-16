@@ -73,6 +73,9 @@ pub struct GeoInfo {
     pub country: Option<String>,
     /// City name in English.
     pub city: Option<String>,
+    /// First-level region (province or state): its ISO 3166-2 code if the
+    /// database has one (GeoLite2 does), else its English name (DB-IP Lite).
+    pub region: Option<String>,
     pub location: Option<LatLon>,
     /// The database's own uncertainty radius, when it provides one.
     pub accuracy_km: Option<u16>,
@@ -120,9 +123,16 @@ impl GeoDb {
         // The decoded record borrows strings from the database (`&str`);
         // `.map(str::to_owned)` copies them into owned `String`s so `GeoInfo`
         // doesn't depend on the reader's lifetime.
+        // The first subdivision is the largest (province or state).
+        let region = city
+            .subdivisions
+            .first()
+            .and_then(|s| s.iso_code.or(s.names.english))
+            .map(str::to_owned);
         Some(GeoInfo {
             country: city.country.iso_code.map(str::to_owned),
             city: city.city.names.english.map(str::to_owned),
+            region,
             location,
             accuracy_km: city.location.accuracy_radius,
         })
@@ -153,6 +163,31 @@ impl AsnDb {
             asn.autonomous_system_organization.map(str::to_owned),
         ))
     }
+}
+
+/// A short place label: `CA-BC`, or with `precise` (developer build)
+/// `CA-BC Victoria`. Missing parts are left out; `?` if nothing is known.
+pub fn place_label(g: &GeoInfo, precise: bool) -> String {
+    let mut s = g.country.clone().unwrap_or_default();
+    if let Some(r) = &g.region {
+        if !s.is_empty() {
+            s.push('-');
+        }
+        s.push_str(r);
+    }
+    if precise && let Some(c) = &g.city {
+        if !s.is_empty() {
+            s.push(' ');
+        }
+        s.push_str(c);
+    }
+    if s.is_empty() { "?".into() } else { s }
+}
+
+/// Great-circle distance between two databases' answers for the same IP, in
+/// km: a simple, honest measure of how uncertain the location is.
+pub fn disagreement_km(a: &GeoInfo, b: &GeoInfo) -> Option<f64> {
+    Some(great_circle_km(a.location?, b.location?))
 }
 
 /// True for addresses GeoIP can't place: private LAN ranges, loopback,
@@ -211,6 +246,43 @@ mod tests {
         // 1000 km one way at 2/3 c: about 10.0 ms round trip.
         let b = fiber_rtt_lower_bound_ms(1000.0);
         assert!((b - 10.007).abs() < 0.01, "{b}");
+    }
+
+    fn info(country: &str, region: Option<&str>, city: Option<&str>) -> GeoInfo {
+        GeoInfo {
+            country: Some(country.into()),
+            city: city.map(Into::into),
+            region: region.map(Into::into),
+            location: None,
+            accuracy_km: None,
+        }
+    }
+
+    #[test]
+    fn place_labels() {
+        let g = info("CA", Some("BC"), Some("Victoria"));
+        assert_eq!(place_label(&g, false), "CA-BC");
+        assert_eq!(place_label(&g, true), "CA-BC Victoria");
+        assert_eq!(place_label(&info("US", None, None), true), "US");
+        let empty = GeoInfo {
+            country: None,
+            city: None,
+            region: None,
+            location: None,
+            accuracy_km: None,
+        };
+        assert_eq!(place_label(&empty, false), "?");
+    }
+
+    #[test]
+    fn disagreement_needs_both_locations() {
+        let mut a = info("CA", None, None);
+        let mut b = info("CA", None, None);
+        assert_eq!(disagreement_km(&a, &b), None);
+        a.location = Some(LatLon { lat: 0.0, lon: 0.0 });
+        b.location = Some(LatLon { lat: 0.0, lon: 1.0 });
+        let d = disagreement_km(&a, &b).unwrap();
+        assert!((d - 111.2).abs() < 0.5, "{d}");
     }
 
     #[test]
