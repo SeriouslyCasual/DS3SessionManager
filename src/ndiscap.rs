@@ -9,20 +9,23 @@
 //!   the relayed player), and the credential in the relay's answers to this
 //!   PC's connectivity checks;
 //! - from any other public address: the credential in a connectivity check
-//!   (a 56-byte binding request), which ties that address to a session.
+//!   (a 56-byte binding request), which ties that address to a session;
+//! - **exact ping**: this PC's own checks (send path) and their answers,
+//!   paired by the check's 16-byte transaction ID (see [`Pairer`]).
 //!
 //! Every other byte, and every other packet, is dropped in the callback.
-//! Nothing but [`Seen`] values (time, addresses, credentials) leaves it.
+//! Nothing but [`Seen`] values (time, addresses, credentials, RTT) leaves it.
 //!
 //! Cost control:
-//! - only receive-path packet events (`ut:ReceivePath`, event 1001) are
-//!   enabled, since the wrapped packets are inbound;
+//! - only packet events (event 1001) are enabled, and frames are dropped
+//!   unless they are UDP with one of the formats above;
 //! - the monitor watches [`Capture::events`] and stops the capture while the
-//!   PC receives more packets than [`MAX_EVENTS_PER_S`] (a download, say),
+//!   PC moves more packets than [`MAX_EVENTS_PER_S`] (a download, say),
 //!   then tries again later.
 //!
 //! Off with `monitor --no-relay-header`.
 
+use std::collections::HashMap;
 use std::net::SocketAddrV4;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -41,9 +44,15 @@ use crate::{geo, gturn, valve};
 const PROVIDER: &str = "2ed6006e-4729-4609-b423-3ee7bcd678ef";
 /// "Packet fragment": one event per captured frame (or frame piece).
 const EVENT_FRAGMENT: u16 = 1001;
-/// Media keywords (any of them) and the receive path (required).
+/// Media keywords (any of them); the send-path keyword tells the direction.
 const KW_MEDIA: u64 = 0x1 | 0x200 | 0x8000 | 0x1_0000; // 802.3, WWAN, tunnel, 802.11
-const KW_RECEIVE: u64 = 0x2_0000_0000;
+const KW_SEND: u64 = 0x1_0000_0000;
+/// How long a sent check waits for its answer. Beyond the ~487 ms check
+/// interval that limits size-and-timing pairing: Run 1b had answers up to
+/// 2.3 s.
+const MAX_WAIT_NS: i128 = 5_000_000_000;
+/// Bound on checks waiting for an answer (old ones are dropped first).
+const MAX_PENDING: usize = 4096;
 /// Packet events per second above which the capture is paused.
 pub const MAX_EVENTS_PER_S: u64 = 5_000;
 /// FILETIME of the Unix epoch, in 100 ns units (as in `etw.rs`).
@@ -66,6 +75,75 @@ pub enum Seen {
         player: SocketAddrV4,
         cred: gturn::Cred,
     },
+    /// An exact round trip: this PC's check to `remote` (in the session using
+    /// this PC's credential `cred`) and its answer, matched by transaction ID.
+    Rtt {
+        t_ns: i128,
+        remote: SocketAddrV4,
+        cred: gturn::Cred,
+        rtt_ns: i128,
+    },
+}
+
+/// Pairs this PC's checks with their answers by transaction ID.
+///
+/// Size-and-timing pairing (`stun.rs`) can't tell which request an answer
+/// belongs to, so a round trip longer than Steam's ~487 ms check interval
+/// reads as a short one (Run 1b: a VPN player at 506–511 ms read as a 28 ms
+/// median), and two sessions on one relay endpoint get mixed. The ID makes
+/// the pairing exact; the request's USERNAME names the session.
+#[derive(Default)]
+pub struct Pairer {
+    pending: HashMap<[u8; 16], (i128, SocketAddrV4, gturn::Cred)>,
+}
+
+impl Pairer {
+    /// A frame on the send path: remember this PC's checks.
+    pub fn sent(&mut self, frame: &[u8], t_ns: i128) {
+        let Some(u) = gturn::frame_udp(frame) else {
+            return;
+        };
+        // A request names the receiver's credential, then ours.
+        let Some((gturn::BINDING_REQUEST, _, mine)) = gturn::check_username(u.payload) else {
+            return;
+        };
+        if self.pending.len() >= MAX_PENDING {
+            self.pending.retain(|_, (t, _, _)| t_ns - *t <= MAX_WAIT_NS);
+            if self.pending.len() >= MAX_PENDING {
+                self.pending.clear();
+            }
+        }
+        // The first sighting wins (a frame can be captured at two layers).
+        self.pending
+            .entry(txid(u.payload))
+            .or_insert((t_ns, u.dst, mine));
+    }
+
+    /// A received datagram: an exact RTT if it answers a remembered check
+    /// from the same endpoint in time.
+    pub fn answered(&mut self, u: &gturn::Udp<'_>, t_ns: i128) -> Option<Seen> {
+        let (gturn::BINDING_SUCCESS, _, _) = gturn::check_username(u.payload)? else {
+            return None;
+        };
+        let (t0, dst, cred) = self.pending.remove(&txid(u.payload))?;
+        let rtt_ns = t_ns - t0;
+        (dst == u.src && (0..=MAX_WAIT_NS).contains(&rtt_ns)).then_some(Seen::Rtt {
+            t_ns,
+            remote: u.src,
+            cred,
+            rtt_ns,
+        })
+    }
+}
+
+/// The 16 bytes after the type and length: the classic STUN transaction ID
+/// (which also covers an RFC 5389 cookie and 96-bit ID).
+fn txid(p: &[u8]) -> [u8; 16] {
+    let mut id = [0u8; 16];
+    if let Some(b) = p.get(4..20) {
+        id.copy_from_slice(b);
+    }
+    id
 }
 
 /// A running capture session. Stops when dropped.
@@ -114,6 +192,7 @@ pub fn start() -> Result<Capture> {
     let events = Arc::new(AtomicU64::new(0));
     let found = Arc::new(AtomicU64::new(0));
     let (ev, fd) = (Arc::clone(&events), Arc::clone(&found));
+    let mut pairer = Pairer::default();
     let callback = move |record: &EventRecord, locator: &SchemaLocator| {
         if record.event_id() != EVENT_FRAGMENT {
             return;
@@ -127,14 +206,18 @@ pub fn start() -> Result<Capture> {
             return;
         };
         let t_ns = (record.raw_timestamp() - FILETIME_UNIX_EPOCH) as i128 * 100;
-        if let Some(seen) = classify(&frame, t_ns) {
+        if record.keyword() & KW_SEND != 0 {
+            pairer.sent(&frame, t_ns);
+            return;
+        }
+        let rtt = gturn::frame_udp(&frame).and_then(|u| pairer.answered(&u, t_ns));
+        for seen in [classify(&frame, t_ns), rtt].into_iter().flatten() {
             fd.fetch_add(1, Ordering::Relaxed);
             let _ = tx.send(seen);
         }
     };
     let provider = Provider::by_guid(PROVIDER)
         .any(KW_MEDIA)
-        .all(KW_RECEIVE)
         .level(5)
         .add_filter(EventFilter::ByEventIds(vec![EVENT_FRAGMENT]))
         .add_callback(callback)
@@ -198,6 +281,45 @@ mod tests {
             );
             assert_eq!(classify(&f, 5), None);
         }
+    }
+
+    /// Run 1b's VPN player: answers came 506–511 ms after each check, longer
+    /// than the 487 ms check interval. Pairing by ID gets them right.
+    #[test]
+    fn checks_pair_with_answers_by_transaction_id_even_past_the_interval() {
+        let (mine, relays) = (*b"PaQ7h7ockbCgChiS", *b"D0FXFIfnCe4dw9rS");
+        let far = SocketAddrV4::new(Ipv4Addr::new(45, 121, 184, 21), 4379);
+        let ms = 1_000_000i128;
+        let mut p = Pairer::default();
+        // Two checks 487 ms apart, each with its own ID.
+        let req = |id: u8, t: i128, p: &mut Pairer| {
+            let mut c = check(BINDING_REQUEST, &relays, &mine, false);
+            c[4..20].copy_from_slice(&[id; 16]);
+            p.sent(&ether(me(), far, &c), t);
+        };
+        req(1, 0, &mut p);
+        req(2, 487 * ms, &mut p);
+        req(2, 487 * ms + 50, &mut p); // the same frame again, another layer
+        let mut ans = check(BINDING_SUCCESS, &relays, &mine, true);
+        ans[4..20].copy_from_slice(&[1; 16]);
+        let f = ether(far, me(), &ans);
+        let u = gturn::frame_udp(&f).unwrap();
+        // Arrives after the second check was sent, yet pairs with the first.
+        assert_eq!(
+            p.answered(&u, 510 * ms),
+            Some(Seen::Rtt {
+                t_ns: 510 * ms,
+                remote: far,
+                cred: mine,
+                rtt_ns: 510 * ms
+            })
+        );
+        // Answered once only; an unknown ID or a different sender pairs nothing.
+        assert_eq!(p.answered(&u, 520 * ms), None);
+        ans[4..20].copy_from_slice(&[2; 16]);
+        let other = SocketAddrV4::new(Ipv4Addr::new(45, 121, 184, 22), 4379);
+        let f2 = ether(other, me(), &ans);
+        assert_eq!(p.answered(&gturn::frame_udp(&f2).unwrap(), 600 * ms), None);
     }
 
     #[test]

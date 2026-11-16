@@ -124,6 +124,11 @@ pub enum RttSource {
     /// the checks.
     #[cfg_attr(not(windows), allow(dead_code))]
     TcpEstats,
+    /// This PC's check and its answer paired by transaction ID from the
+    /// packet capture (`ndiscap.rs`): exact, with no ~487 ms limit, and per
+    /// session even on a shared relay endpoint.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    CheckId,
 }
 
 impl RttSource {
@@ -132,6 +137,7 @@ impl RttSource {
         match self {
             RttSource::EtwStun => "etw_stun",
             RttSource::TcpEstats => "tcp_estats",
+            RttSource::CheckId => "check_id",
         }
     }
 }

@@ -81,16 +81,16 @@ The program is `target\release\ds3sm.exe`. The build places the required `steam_
 | `st` | `A` = connected, `C` = connecting. `A!` = Steam says connected, but no game data has reached your PC over UDP for several seconds: the connection has moved somewhere the tool can't follow, so the ping, jitter and loss numbers are out of date. This happens when the connection is very bad. (Steam's TCP fallback is followed automatically and shows as `tcp` under `relay` instead, unless you started with `--no-tcp`.) |
 | `relay` | `no` = direct. `yes*` = going through a Valve relay server, and ds3sm found the relay's connections. `yes` = Steam says it's relayed, but the relay wasn't found. `tcp` = Steam has moved the connection to its **TCP fallback**, a direct TCP link to the player that it uses when normal (UDP) traffic keeps failing. Other players' movement usually looks choppier on this path than on a normal connection with the same ping. The ping columns then show the lowest of Windows' own measurements of that TCP connection over the last 10 seconds, in whole milliseconds (taking the lowest filters out the extra wait when the other PC delays its acknowledgements). Jitter includes TCP's own resend delay, and `nrep%` shows the share of your packets TCP had to send again (marked `r`). |
 | `via` | Which signs of a relay were seen: `F` Steam's own flag, `P` the traffic pattern, `A` the network owner (needs the ASN database), `L` ds3sm's built-in list of Valve relay addresses. `-` = none. |
-| `last` / `med` / `p95` | Latest, typical and worst-case ping in milliseconds. Through a relay, this is the full round trip to the player and back, not just to the relay. |
+| `last` / `med` / `p95` | Latest, typical and worst-case ping in milliseconds. Through a relay, this is the full round trip to the player and back, not just to the relay. With relay header reading on (the default), each of Steam's checks is matched to its own answer, so even very high pings (over half a second) are measured correctly; without it, pings above about 490 ms can read too low. |
 | `sd` / `ipdv` | Two measures of how much the ping varies (ms). Lower is smoother. |
 | `jit` | Jitter of the game data arriving from that player (ms, RFC 3550). The other player's game sends a packet about 12 times a second; this shows how unevenly they arrive. Well below 1 ms on a home network, a few ms through a relay. It's updated with every packet, so it reacts much faster than the ping columns. |
 | `nrep%` | Share of Steam's connection checks that got no reply: a loss estimate |
 | `pps_in` / `pps_out` | Packets per second to and from that player (all relay connections included) |
-| `player` | The player's own rough location: country and province/state (e.g. `CA-BC`). For a relayed player, Steam only gives the relay's address, so ds3sm finds the player's own address from their traffic (see below). `-` until it has. |
+| `player` | The player's own rough location: country and province/state (e.g. `CA-BC`). For a relayed player, Steam only gives the relay's address, so ds3sm finds the player's own address from their traffic (see below). `-` until it has. A `vpn`, `cloud` or `sat` tag means the address belongs to a VPN, a cloud server or gaming accelerator, or a satellite ISP: the place shown is that network's, not the player's. |
 | `relay_loc` | The Steam relay in use: its site code and city (e.g. `sea Seattle`). `-` for a direct connection. |
 | `km` | Estimated distance to the player (needs `--home-lat`/`--home-lon`). |
 | `bound` | Fastest physically possible ping for that distance |
-| `infl` | Actual ping ÷ fastest possible. Around 2–4 is normal; much higher suggests a long route, a relay or a VPN. Left blank when the player's own location isn't known. |
+| `infl` | Actual ping ÷ fastest possible. Around 2–4 is normal; much higher suggests a long route, a relay or a VPN. Left blank when the player's own location isn't known (including `vpn`/`cloud`/`sat` rows). `loc?` = the ping is too short for that distance, so the location can't be the player's. For those rows a note below the table gives the farthest the player can be, worked out from the ping. |
 
 `-` means "not available for this connection". The tool never guesses.
 
@@ -98,11 +98,11 @@ For a relayed player, a **Relay for …** section below the table lists each rel
 
 - **reported by Steam**: the player was on a direct connection at some point, so Steam gave their address.
 - **the player's own checks for this session (exact)**: often only *your* traffic goes through the relay, while the other player's game sends straight to your PC, together with Steam's connection checks. Those checks carry the same session ID as the checks on the relay connection Steam reports for that player, so the address is matched to the right player exactly.
-- **the relay header** or **direct inbound stream (timing)**: for players whose packets only arrive through a relay, the relay's header names the player, but nothing ties it to a session. ds3sm then matches by timing: the address appears within a few seconds of that player's relay connection starting. It only links when exactly one player fits, and waits about 20 seconds before deciding. An exact match always replaces a timing match.
+- **the relay header** or **direct inbound stream (timing)**: for players whose packets only arrive through a relay, the relay's header names the player, but nothing ties it to a session. ds3sm then matches by timing: the address appears a few seconds before Steam reports that player's relay connection. It only links when exactly one player fits, and waits about 25 seconds before deciding. An exact match always replaces a timing match.
 
 The address is used only to look up the player's rough location; it's never shown.
 
-If two players happen to use the same relay connection, their ping checks can't be told apart there, so ds3sm holds back new ping samples for both until that ends (a `shared relay` note says so).
+If two players happen to use the same relay connection, their ping checks can't be told apart by size and timing. With relay header reading on, each check is still matched exactly; without it, ds3sm holds back new ping samples for both until that ends (a `shared relay` note says so).
 
 Steam doesn't always say when it relays a connection, so ds3sm treats a player as relayed if any of the signs in `via` appear. To choose which signs count, use for example `--relay-detect F,L`. All four are always recorded in the session log.
 

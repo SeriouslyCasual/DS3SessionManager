@@ -190,6 +190,89 @@ pub fn disagreement_km(a: &GeoInfo, b: &GeoInfo) -> Option<f64> {
     Some(great_circle_km(a.location?, b.location?))
 }
 
+/// An address whose GeoIP location is a network's, not the player's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NetKind {
+    /// A VPN exit: the player can be anywhere.
+    Vpn,
+    /// A cloud server or gaming accelerator node: the player is somewhere
+    /// behind it, often far away (Run 1b: several "Hong Kong" players).
+    Cloud,
+    /// A satellite ISP: located at the ground station, not the dish.
+    Satellite,
+}
+
+impl NetKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            NetKind::Vpn => "vpn",
+            NetKind::Cloud => "cloud",
+            NetKind::Satellite => "sat",
+        }
+    }
+}
+
+/// Networks seen carrying players in the runs or widely used for VPNs and
+/// accelerators, by ASN. Checked first; the name keywords below catch others.
+const VPN_ASNS: &[u32] = &[
+    13335,  // Cloudflare (WARP), Run 1b
+    9009,   // M247
+    60068,  // Datacamp / CDN77
+    212238, // Datacamp, Run 1b
+    136787, // TEFINCOM (NordVPN)
+    147049, // PacketHub
+];
+const CLOUD_ASNS: &[u32] = &[
+    137263, // NetEase Hong Kong (UU accelerator), Run 1b
+    136897, // Enjoyvc Cloud, Run 1b
+    21859,  // Zenlayer, Run 1b
+    45102,  // Alibaba (US), Run 1b
+    37963,  // Alibaba (China)
+    132203, // Tencent
+    16509, 14618, // Amazon
+    15169, 396982, // Google
+    8075,   // Microsoft
+    16276,  // OVH
+    24940,  // Hetzner
+    14061,  // DigitalOcean
+    63949,  // Akamai (Linode)
+    20473,  // Vultr
+];
+const SATELLITE_ASNS: &[u32] = &[14593]; // SpaceX (Starlink), Run 1b
+
+/// Classify a network from the ASN database (`AsnDb::lookup`). `None` for an
+/// ordinary ISP (or unknown), where GeoIP's location is the best estimate.
+pub fn net_kind(asn: u32, org: Option<&str>) -> Option<NetKind> {
+    if VPN_ASNS.contains(&asn) {
+        return Some(NetKind::Vpn);
+    }
+    if SATELLITE_ASNS.contains(&asn) {
+        return Some(NetKind::Satellite);
+    }
+    if CLOUD_ASNS.contains(&asn) {
+        return Some(NetKind::Cloud);
+    }
+    let org = org?.to_ascii_lowercase();
+    if org.contains("vpn") {
+        Some(NetKind::Vpn)
+    } else if ["hosting", "datacenter", "data center", "cloud", "server"]
+        .iter()
+        .any(|k| org.contains(k))
+    {
+        Some(NetKind::Cloud)
+    } else {
+        None
+    }
+}
+
+/// The farthest a player can be, from the round trip alone: light in fiber
+/// can't cover more than `rtt / 2` each way. Holds whatever the path (relay,
+/// VPN), so it's a hard limit; GeoIP saying farther means GeoIP is wrong for
+/// this player (a VPN or cloud exit, say).
+pub fn max_distance_km(min_rtt_ms: f64) -> f64 {
+    min_rtt_ms / 2.0 / 1000.0 * C_KM_S * FIBER_FRACTION
+}
+
 /// True for addresses GeoIP can't place: private LAN ranges, loopback,
 /// link-local, carrier-grade NAT, and so on. Your own PCs on the same home
 /// network fall in here.
@@ -283,6 +366,48 @@ mod tests {
         b.location = Some(LatLon { lat: 0.0, lon: 1.0 });
         let d = disagreement_km(&a, &b).unwrap();
         assert!((d - 111.2).abs() < 0.5, "{d}");
+    }
+
+    /// The networks of Run 1b's unusual players, by the names DB-IP gives.
+    #[test]
+    fn vpn_cloud_and_satellite_networks_are_recognised() {
+        assert_eq!(
+            net_kind(13335, Some("Cloudflare, Inc.")),
+            Some(NetKind::Vpn)
+        );
+        assert_eq!(
+            net_kind(212238, Some("Datacamp Limited")),
+            Some(NetKind::Vpn)
+        );
+        assert_eq!(
+            net_kind(137263, Some("NETEASE (HONG KONG) LIMITED")),
+            Some(NetKind::Cloud)
+        );
+        assert_eq!(
+            net_kind(14593, Some("Space Exploration Technologies Corporation")),
+            Some(NetKind::Satellite)
+        );
+        assert_eq!(net_kind(1, Some("Example VPN Ltd")), Some(NetKind::Vpn));
+        assert_eq!(net_kind(1, Some("Some Hosting GmbH")), Some(NetKind::Cloud));
+        // Home ISPs from the same run: no flag.
+        for (n, org) in [
+            (10796, "Charter Communications Inc"),
+            (4766, "Korea Telecom"),
+            (22047, "VTR BANDA ANCHA S.A."),
+            (4134, "Chinanet"),
+        ] {
+            assert_eq!(net_kind(n, Some(org)), None, "{org}");
+        }
+        assert_eq!(net_kind(1, None), None);
+    }
+
+    /// Run 1b: a "Hong Kong" cloud address (10,303 km) answered in 57.8 ms,
+    /// which allows at most ~5,800 km: that location can't be the player's.
+    #[test]
+    fn round_trip_caps_the_distance() {
+        let d = max_distance_km(57.8);
+        assert!((5_700.0..5_900.0).contains(&d), "{d}");
+        assert!((max_distance_km(fiber_rtt_lower_bound_ms(10_303.0)) - 10_303.0).abs() < 1e-6);
     }
 
     #[test]

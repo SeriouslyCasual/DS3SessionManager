@@ -270,11 +270,20 @@ def episode_stats(db: sqlite3.Connection, ep: Episode, settle_ns: int) -> dict:
     d: dict = {"duration_s": (ep.end_ns - ep.start_ns) / S}
     if hi <= lo:
         return d
-    src = "tcp_estats" if ep.path == "tcp" else "etw_stun"
-    rtt = [r for (r,) in db.execute(
-        "SELECT rtt_ms FROM rtt WHERE steam_id = ? AND source = ? AND t_ns BETWEEN ? AND ?",
-        (ep.peer, src, lo, hi),
-    )]
+    def rtts(src: str) -> list[float]:
+        return [r for (r,) in db.execute(
+            "SELECT rtt_ms FROM rtt WHERE steam_id = ? AND source = ? AND t_ns BETWEEN ? AND ?",
+            (ep.peer, src, lo, hi),
+        )]
+
+    # Exact samples (checks paired by transaction ID) when the run has them:
+    # no ~487 ms aliasing and no mixing on a shared relay endpoint.
+    if ep.path == "tcp":
+        src, rtt = "tcp_estats", rtts("tcp_estats")
+    else:
+        src, rtt = "check_id", rtts("check_id")
+        if not rtt:
+            src, rtt = "etw_stun", rtts("etw_stun")
     d["rtt_source"] = src
     d["n_rtt"] = len(rtt)
     d["rtt_min"], d["rtt_p50"], d["rtt_p95"] = min(rtt, default=None), med(rtt), pct(rtt, 0.95)

@@ -79,6 +79,13 @@ impl Rolling {
         self.buf.push_back(v);
     }
 
+    /// Drop every sample (when a better method takes over, so its samples
+    /// aren't mixed with the old ones).
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn clear(&mut self) {
+        self.buf.clear();
+    }
+
     /// Compute the summary, or `None` if there are no samples yet.
     ///
     /// Returning `Option` forces callers to handle the "no data" case. They

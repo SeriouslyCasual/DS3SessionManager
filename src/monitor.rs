@@ -29,7 +29,7 @@ use anyhow::{Context, Result};
 use crate::MonitorArgs;
 use crate::estats;
 use crate::etw::{self, ByteOrder};
-use crate::geo::{self, AsnDb, GeoDb, GeoInfo, LatLon};
+use crate::geo::{self, AsnDb, GeoDb, GeoInfo, LatLon, NetKind};
 use crate::jitter::StreamJitter;
 use crate::model::{P2PState, Provenance, RttSample, RttSource, SteamId};
 use crate::ndiscap;
@@ -408,6 +408,13 @@ struct PeerView {
     /// told apart by size and timing, so RTT samples there are kept out of
     /// both players' statistics (stored without a Steam ID).
     shared_remote: bool,
+    /// Kernel time of the newest exact RTT sample (`RttSource::CheckId`).
+    /// While those arrive, size-and-timing samples are logged but kept out
+    /// of the rolling statistics.
+    exact_rtt_ns: i128,
+    /// The player's address is a VPN exit, cloud node or satellite ISP
+    /// (`geo::net_kind`): its location is the network's, not the player's.
+    net_kind: Option<NetKind>,
 }
 
 /// Steam's TCP fallback connection to a peer, with statistics collection on.
@@ -500,6 +507,8 @@ impl PeerView {
             player_link: None,
             player_ep: None,
             shared_remote: false,
+            exact_rtt_ns: 0,
+            net_kind: None,
         }
     }
 
@@ -707,7 +716,7 @@ pub fn run(args: MonitorArgs) -> Result<()> {
             )?;
         }
         // 1a. Relay wrapper headers.
-        hdr.drain(&mut players, &peers, &store)?;
+        hdr.drain(&mut players, &mut peers, &by_endpoint, &store)?;
         // 1b. Drain TCP fallback events (on unless `--no-tcp`).
         if let (Some(t), Some(bo), Some(tp)) = (&trace, byte_order, tcp_paths.as_mut()) {
             drain_tcp(t, bo, steam_pid, tp, &by_endpoint, &store)?;
@@ -850,14 +859,7 @@ pub fn run(args: MonitorArgs) -> Result<()> {
             if view.evidence.remote_is_relay(&ctx.detectors) {
                 if let Some(l) = view.player_link {
                     if view.geo_ip != Some(l.ip) {
-                        locate(
-                            view,
-                            *id,
-                            SocketAddrV4::new(l.ip, 0),
-                            geodb.as_ref(),
-                            home,
-                            &store,
-                        )?;
+                        locate(view, *id, SocketAddrV4::new(l.ip, 0), &ctx, &store)?;
                     }
                     continue;
                 }
@@ -872,7 +874,7 @@ pub fn run(args: MonitorArgs) -> Result<()> {
                     store.event(t, "geo_reclassified", &format!("{id} {remote} relay"))?;
                 }
             } else if view.geo_ip != Some(*remote.ip()) {
-                locate(view, *id, remote, geodb.as_ref(), home, &store)?;
+                locate(view, *id, remote, &ctx, &store)?;
             }
         }
 
@@ -958,6 +960,10 @@ pub fn run(args: MonitorArgs) -> Result<()> {
     Ok(())
 }
 
+/// How long one exact RTT sample keeps size-and-timing samples out of a
+/// player's statistics (checks come every ~0.5–1 s).
+const EXACT_HOLD_NS: i128 = 5_000_000_000;
+
 /// Relay wrapper header reading (`ndiscap.rs`), with its cost guard: while
 /// the PC receives more than `ndiscap::MAX_EVENTS_PER_S` packets a second,
 /// the capture is stopped, and started again [`HDR_RETRY`] later.
@@ -1020,7 +1026,8 @@ impl RelayHeader {
     fn drain(
         &mut self,
         players: &mut playerip::Matcher,
-        peers: &HashMap<SteamId, PeerView>,
+        peers: &mut HashMap<SteamId, PeerView>,
+        by_endpoint: &HashMap<SocketAddrV4, SteamId>,
         store: &Store,
     ) -> Result<()> {
         let Some(c) = &self.cap else { return Ok(()) };
@@ -1044,6 +1051,37 @@ impl RelayHeader {
                 ndiscap::Seen::PlayerCred { t_ns, player, cred } => {
                     if players.player_credential(player, cred, t_ns) {
                         store.insert_player_seen(t_ns, player, Source::Credential.as_str())?;
+                    }
+                }
+                ndiscap::Seen::Rtt {
+                    t_ns,
+                    remote,
+                    cred,
+                    rtt_ns,
+                } => {
+                    // The session's player: by credential (exact, even on a
+                    // shared relay endpoint), else by Steam's endpoint.
+                    let id = players.owner_of(&cred).or_else(|| {
+                        by_endpoint
+                            .get(&remote)
+                            .copied()
+                            .filter(|id| peers.get(id).is_some_and(|v| !v.shared_remote))
+                    });
+                    let rtt_ms = rtt_ns as f64 / 1e6;
+                    let sample = RttSample {
+                        t_ns,
+                        rtt_ms,
+                        source: RttSource::CheckId,
+                    };
+                    store.insert_rtt(id, remote, &sample)?;
+                    if let Some(v) = id.and_then(|id| peers.get_mut(&id)) {
+                        if t_ns - v.exact_rtt_ns > EXACT_HOLD_NS {
+                            // Exact samples take over: drop the paired-by-size
+                            // ones, which may include aliased values.
+                            v.rtt.clear();
+                        }
+                        v.rtt.push(rtt_ms);
+                        v.exact_rtt_ns = t_ns;
                     }
                 }
             }
@@ -1640,7 +1678,11 @@ fn drain_etw(
             };
             store.insert_rtt(id, m.remote, &sample)?;
             match id.and_then(|id| peers.get_mut(&id)) {
-                Some(view) => view.rtt.push(m.rtt_ms),
+                Some(view) => {
+                    if m.t_ns - view.exact_rtt_ns > EXACT_HOLD_NS {
+                        view.rtt.push(m.rtt_ms);
+                    }
+                }
                 None if steam_other => side
                     .rtt
                     .entry(m.remote)
@@ -1792,10 +1834,10 @@ fn locate(
     view: &mut PeerView,
     id: SteamId,
     remote: SocketAddrV4,
-    geodb: Option<&GeoDb>,
-    home: Option<LatLon>,
+    ctx: &RelayCtx<'_>,
     store: &Store,
 ) -> Result<()> {
+    let (geodb, home) = (ctx.geodb, ctx.home);
     let ip = IpAddr::V4(*remote.ip());
     // Remember the address even if the lookup finds nothing, so it isn't
     // retried on every poll; a new address triggers a new lookup.
@@ -1803,10 +1845,20 @@ fn locate(
     view.geo = None;
     view.distance_km = None;
     view.bound_ms = None;
-    let Some(db) = geodb else { return Ok(()) };
+    view.net_kind = None;
     if geo::is_non_public(ip) {
         return Ok(());
     }
+    // A VPN, cloud or satellite network: GeoIP places the network, not the
+    // player, so the row says so (and leaves out the inflation).
+    view.net_kind = ctx
+        .asn
+        .and_then(|db| db.lookup(ip))
+        .and_then(|(n, org)| geo::net_kind(n, org.as_deref()));
+    if let Some(k) = view.net_kind {
+        store.event(now_ns(), "player_network", &format!("{id} {}", k.label()))?;
+    }
+    let Some(db) = geodb else { return Ok(()) };
     if let Some(g) = db.lookup(ip) {
         if let (Some(h), Some(loc)) = (home, g.location) {
             let d = geo::great_circle_km(h, loc);
@@ -2006,16 +2058,25 @@ fn draw(
         // Two separate places: the player's own (from their public IP; the
         // country and region in the public build, plus the city in the
         // developer build) and the Valve relay in use, if any.
-        let player = v
+        let mut player = v
             .geo
             .as_ref()
             .map_or_else(|| "-".into(), |g| geo::place_label(g, SHOW_IPS));
+        if let Some(k) = v.net_kind {
+            player = format!("{player} {}", k.label());
+        }
         let relay_loc = v.relay_geo.as_ref().map_or_else(|| "-".into(), relay_label);
         let (km, bound) = (v.distance_km, v.bound_ms);
+        // A typical ping below the fiber bound means GeoIP's place can't be
+        // the player's (`geo::max_distance_km`).
+        let loc_bad = matches!((s, v.bound_ms), (Some(s), Some(b)) if s.median < b);
         let infl = match (s, v.bound_ms, &v.geo) {
-            (Some(s), Some(b), Some(_)) if b > 0.5 => Some(s.median / b),
+            (Some(s), Some(b), Some(_)) if b > 0.5 && v.net_kind.is_none() && !loc_bad => {
+                Some(s.median / b)
+            }
             _ => None,
         };
+        let infl_col = if loc_bad { "loc?".into() } else { opt(infl, 1) };
         let name: String = v
             .persona
             .clone()
@@ -2043,7 +2104,7 @@ fn draw(
             trunc(&relay_loc, 14),
             opt(km, 0),
             opt(bound, 1),
-            opt(infl, 1),
+            infl_col,
         ));
     }
     if current.is_empty() {
@@ -2089,8 +2150,32 @@ fn draw(
     for (_, v) in shown.iter().filter(|(_, v)| v.shared_remote) {
         let name = v.persona.clone().unwrap_or_else(|| "?".into());
         out.push_str(&format!(
-            "shared relay: {name} uses the same relay endpoint as another player; their checks can't be told apart there, \
-             so new ping samples and nrep% are held back until that ends\n"
+            "shared relay: {name} uses the same relay endpoint as another player; their checks can't be told apart by \
+             size and timing there, so only exact (relay header reading) ping samples count, and nrep% is held back\n"
+        ));
+    }
+    // Where GeoIP can't be trusted, the ping still caps the distance.
+    for (_, v) in shown.iter() {
+        let s = v.rtt.summary();
+        let loc_bad = matches!((s, v.bound_ms), (Some(s), Some(b)) if s.median < b);
+        if v.net_kind.is_none() && !loc_bad {
+            continue;
+        }
+        let name = v.persona.clone().unwrap_or_else(|| "?".into());
+        let what = match v.net_kind {
+            Some(NetKind::Vpn) => "a VPN exit",
+            Some(NetKind::Cloud) => "a cloud server or gaming accelerator",
+            Some(NetKind::Satellite) => "a satellite ISP (located at its ground station)",
+            None => "a place the ping rules out",
+        };
+        let cap = s.map_or_else(String::new, |s| {
+            format!(
+                "; from the ping, the player is within {:.0} km",
+                geo::max_distance_km(s.min)
+            )
+        });
+        out.push_str(&format!(
+            "{name}: the address is {what}, so the player's own location is unknown and infl is left out{cap}\n"
         ));
     }
 

@@ -23,7 +23,8 @@
 //!    wrapped, whose checks use other credentials): a sighting appears
 //!    within a few seconds of a relayed player's relay episode starting.
 //!    Conservative: a sighting is linked only when exactly one unlinked
-//!    player started an episode within [`WINDOW_NS`] of it **and** that start
+//!    player started an episode in the window around it ([`BEFORE_NS`],
+//!    [`AFTER_NS`]) **and** that start
 //!    matches exactly one unlinked address, judged once the sighting is
 //!    [`SETTLE_NS`] old, repeated to a fixpoint (elimination). An exact link
 //!    always replaces a timing link.
@@ -37,16 +38,22 @@ use std::net::{Ipv4Addr, SocketAddrV4};
 use crate::gturn::Cred;
 use crate::model::SteamId;
 
-/// How far apart (ns) a sighting and a relay episode start may be. In the
-/// Run 1b capture the player's stream (or first wrapped packet) came 2.4–4 s
-/// *before* Steam reported the new relay episode (Steam is polled every
-/// 0.5 s).
-pub const WINDOW_NS: i128 = 5_000_000_000;
+/// How far a sighting may come before / after a relay episode start. In the
+/// Run 1b capture the player's stream or first wrapped packet always came
+/// *before* Steam reported the relay episode, by 2.4–5.5 s (the most for a
+/// VPN player with a 510 ms ping); Steam is polled every 0.5 s.
+pub const BEFORE_NS: i128 = 8_000_000_000;
+pub const AFTER_NS: i128 = 3_000_000_000;
 /// How old a sighting must be before it is judged. A competing sighting can
-/// start up to two windows later and needs time to show up (the direct-stream
-/// rate check covers 5 s and ends 1.5 s back; ETW delivers ~1 s late).
-/// Judging earlier could link on incomplete information.
-pub const SETTLE_NS: i128 = 2 * WINDOW_NS + 10_000_000_000;
+/// start up to `BEFORE_NS + AFTER_NS` later and needs time to show up (the
+/// direct-stream rate check covers 5 s and ends 1.5 s back; ETW delivers
+/// ~1 s late). Judging earlier could link on incomplete information.
+pub const SETTLE_NS: i128 = BEFORE_NS + AFTER_NS + 14_000_000_000;
+
+/// Whether a sighting at `seen` fits a relay episode starting at `start`.
+fn fits(start: i128, seen: i128) -> bool {
+    (-AFTER_NS..=BEFORE_NS).contains(&(start - seen))
+}
 /// How long starts, sightings and credentials are kept.
 const HISTORY_NS: i128 = 15 * 60 * 1_000_000_000;
 
@@ -161,6 +168,11 @@ impl Matcher {
         true
     }
 
+    /// The player whose session uses this PC's credential `cred`, if known.
+    pub fn owner_of(&self, cred: &Cred) -> Option<SteamId> {
+        self.cred_owner.get(cred).copied()
+    }
+
     pub fn link(&self, id: SteamId) -> Option<Link> {
         self.links.get(&id).copied()
     }
@@ -247,7 +259,7 @@ impl Matcher {
                 if linked_ips.contains(s.ep.ip()) || now_ns - s.t_ns < SETTLE_NS {
                     return None;
                 }
-                let near = |t: i128| (t - s.t_ns).abs() <= WINDOW_NS;
+                let near = |t: i128| fits(t, s.t_ns);
                 let peers: HashSet<SteamId> = self
                     .starts
                     .iter()
@@ -265,7 +277,7 @@ impl Matcher {
                     .flat_map(|(_, t)| {
                         self.sightings
                             .iter()
-                            .filter(move |o| (o.t_ns - t).abs() <= WINDOW_NS)
+                            .filter(move |o| fits(*t, o.t_ns))
                             .map(|o| *o.ep.ip())
                     })
                     .filter(|ip| !linked_ips.contains(ip))
@@ -326,6 +338,18 @@ mod tests {
         assert!(m.resolve(131 * S).is_empty());
     }
 
+    /// Run 1b's VPN player: its wrapped address came 5.5 s before Steam
+    /// reported the relay. A sighting after the start fits only briefly.
+    #[test]
+    fn the_window_is_wider_before_the_start_than_after() {
+        let mut m = Matcher::default();
+        m.relay_start(SteamId(1), 2022 * S + S / 2);
+        see(&mut m, 50, 28694, 2017, Source::Wrapper);
+        assert_eq!(m.resolve(2050 * S).len(), 1);
+        assert!(fits(10 * S, 3 * S) && fits(10 * S, 13 * S));
+        assert!(!fits(10 * S, S) && !fits(10 * S, 14 * S));
+    }
+
     #[test]
     fn far_apart_or_ambiguous_does_not_link() {
         let mut m = Matcher::default();
@@ -360,7 +384,7 @@ mod tests {
         assert!(m.resolve(3020 * S).is_empty());
         m.relay_start(SteamId(1), 3128 * S);
         see(&mut m, 31, 56234, 3127, Source::Wrapper);
-        let made = m.resolve(3150 * S);
+        let made = m.resolve(3160 * S);
         assert_eq!(made.len(), 2);
         assert_eq!(m.link(SteamId(1)).map(|l| l.ip), Some(ip(31)));
         assert_eq!(m.link(SteamId(2)).map(|l| l.ip), Some(ip(30)));
