@@ -187,6 +187,10 @@ enum Cmd {
         #[arg(long, default_value = "run")]
         label: String,
     },
+    /// Check that Windows' packet capture delivers packets (run as
+    /// administrator; used by relay header reading).
+    #[command(hide = true)]
+    RelayHeaderTest,
     /// Compare two GeoIP databases on the players' addresses in a run.
     GeoCompare {
         /// Run database to read the players' addresses from.
@@ -264,6 +268,8 @@ fn main() -> Result<()> {
         Cmd::Probe { geo, asn } => monitor::probe(&geo, &asn),
         #[cfg(windows)]
         Cmd::Monitor(args) => monitor::run(args),
+        #[cfg(windows)]
+        Cmd::RelayHeaderTest => ndiscap::self_test(),
         // On non-Windows builds the two arms above don't exist, so this
         // catch-all keeps the `match` exhaustive.
         #[cfg(not(windows))]

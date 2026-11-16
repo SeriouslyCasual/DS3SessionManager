@@ -154,6 +154,8 @@ pub struct Capture {
     pub events: Arc<AtomicU64>,
     /// Packets that produced a [`Seen`].
     pub wrapped: Arc<AtomicU64>,
+    /// Every event from the provider, of any kind (diagnostics).
+    pub any_events: Arc<AtomicU64>,
 }
 
 fn is_player_ip(ip: std::net::Ipv4Addr) -> bool {
@@ -187,13 +189,64 @@ fn classify(frame: &[u8], t_ns: i128) -> Option<Seen> {
     })
 }
 
+/// How the provider is enabled. The monitor uses [`Config::DEFAULT`];
+/// `ds3sm relay-header-test` tries the variants to find what a PC delivers.
+#[derive(Clone, Copy, Debug)]
+pub struct Config {
+    pub name: &'static str,
+    pub any: u64,
+    pub level: u8,
+    pub id_filter: bool,
+}
+
+impl Config {
+    pub const DEFAULT: Config = Config {
+        name: "media keywords, verbose, packet events only",
+        any: KW_MEDIA,
+        level: 5,
+        id_filter: true,
+    };
+    /// The variants the self-test tries, the default first.
+    pub const VARIANTS: [Config; 4] = [
+        Config::DEFAULT,
+        Config {
+            name: "media keywords, verbose, no event filter",
+            any: KW_MEDIA,
+            level: 5,
+            id_filter: false,
+        },
+        Config {
+            name: "all keywords, verbose, no event filter",
+            any: u64::MAX,
+            level: 5,
+            id_filter: false,
+        },
+        Config {
+            name: "all keywords, informational, no event filter",
+            any: u64::MAX,
+            level: 4,
+            id_filter: false,
+        },
+    ];
+}
+
 pub fn start() -> Result<Capture> {
+    start_with(Config::DEFAULT)
+}
+
+pub fn start_with(cfg: Config) -> Result<Capture> {
     let (tx, rx) = channel();
     let events = Arc::new(AtomicU64::new(0));
     let found = Arc::new(AtomicU64::new(0));
-    let (ev, fd) = (Arc::clone(&events), Arc::clone(&found));
+    let any_events = Arc::new(AtomicU64::new(0));
+    let (ev, fd, ae) = (
+        Arc::clone(&events),
+        Arc::clone(&found),
+        Arc::clone(&any_events),
+    );
     let mut pairer = Pairer::default();
     let callback = move |record: &EventRecord, locator: &SchemaLocator| {
+        ae.fetch_add(1, Ordering::Relaxed);
         if record.event_id() != EVENT_FRAGMENT {
             return;
         }
@@ -216,12 +269,11 @@ pub fn start() -> Result<Capture> {
             let _ = tx.send(seen);
         }
     };
-    let provider = Provider::by_guid(PROVIDER)
-        .any(KW_MEDIA)
-        .level(5)
-        .add_filter(EventFilter::ByEventIds(vec![EVENT_FRAGMENT]))
-        .add_callback(callback)
-        .build();
+    let mut provider = Provider::by_guid(PROVIDER).any(cfg.any).level(cfg.level);
+    if cfg.id_filter {
+        provider = provider.add_filter(EventFilter::ByEventIds(vec![EVENT_FRAGMENT]));
+    }
+    let provider = provider.add_callback(callback).build();
     let trace = UserTrace::new()
         .named(format!("ds3sm-relayhdr-{}", std::process::id()))
         .enable(provider)
@@ -233,8 +285,53 @@ pub fn start() -> Result<Capture> {
         rx,
         events,
         wrapped: found,
+        any_events,
     })
 }
+
+/// `ds3sm relay-header-test`: start the capture each way in
+/// [`Config::VARIANTS`] for a few seconds while sending small UDP packets to a
+/// TEST-NET address (RFC 5737, routed nowhere), and report what arrived.
+/// Shows whether this PC's packet capture delivers events at all, and how it
+/// has to be enabled.
+pub fn self_test() -> Result<()> {
+    let sock = std::net::UdpSocket::bind("0.0.0.0:0")?;
+    let target = SocketAddrV4::new(std::net::Ipv4Addr::new(192, 0, 2, 1), 50002);
+    println!("relay header self-test: {} s per variant", TEST_SECS);
+    println!(
+        "{:<48} {:>10} {:>14} {:>10}",
+        "variant", "events", "packet events", "useful"
+    );
+    for cfg in Config::VARIANTS {
+        let line = match start_with(cfg) {
+            Ok(c) => {
+                let end = std::time::Instant::now() + std::time::Duration::from_secs(TEST_SECS);
+                while std::time::Instant::now() < end {
+                    let _ = sock.send_to(&[0u8; 37], target);
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                while c.rx.try_recv().is_ok() {}
+                format!(
+                    "{:<48} {:>10} {:>14} {:>10}",
+                    cfg.name,
+                    c.any_events.load(Ordering::Relaxed),
+                    c.events.load(Ordering::Relaxed),
+                    c.wrapped.load(Ordering::Relaxed)
+                )
+            }
+            Err(e) => format!("{:<48} failed: {e:#}", cfg.name),
+        };
+        println!("{line}");
+    }
+    println!(
+        "\n'packet events' should be well above 0 (this test alone sends {} packets).",
+        TEST_SECS * 10
+    );
+    println!("'useful' counts Steam checks and relay headers, so it is 0 unless Steam is talking.");
+    Ok(())
+}
+
+const TEST_SECS: u64 = 6;
 
 #[cfg(test)]
 mod tests {
