@@ -28,7 +28,7 @@ DS3SessionManager is a free Windows tool that runs alongside Dark Souls III. For
 ## Is it safe to use?
 
 - The monitor is **read-only**. It never modifies the game. It asks your Steam client which players you're connected to, and it reads Windows' own network statistics to time packets.
-- To place relayed players, it also reads a little connection information from received packets, using Windows' built-in packet capture: the header a Steam relay server adds (which says which player the packet is from), and the session ID inside Steam's connection checks. It never reads the game's own data. Turn this off with `--no-relay-header`.
+- To place relayed players and measure ping exactly, it also reads a little connection information from network packets, using Windows Packet Monitor (`pktmon`, built into Windows): the header a Steam relay server adds (which says which player the packet is from), and the IDs inside Steam's connection checks. It never reads the game's own data. While the monitor runs, it starts Packet Monitor with a UDP-only filter and short packet copies kept in memory, and stops it when you quit (if you already had Packet Monitor running, it leaves yours alone). Turn this off with `--no-relay-header`.
 - It doesn't inject anything into the game and doesn't change game files or memory.
 - Any future feature that does more will be **off by default**, clearly labelled, and only released after thorough testing.
 
@@ -116,7 +116,8 @@ Steam doesn't always say when it relays a connection, so ds3sm treats a player a
 | No players listed | You need to be in a multiplayer session (summoned, summoning or invaded). |
 | Ping column empty | Run `probe` and include its output when you report the issue. |
 | `relay header reading: paused (heavy traffic)` | Your PC is receiving a lot of data (a download, say). Reading relay headers pauses to keep the cost low and tries again two minutes later. |
-| `relay header reading: off` with a note at startup | Windows' packet capture couldn't start. Everything else works; relayed players are then placed from their direct stream only. |
+| `relay header reading: off` with a note at startup | Windows Packet Monitor couldn't start (it needs Windows 10 version 2004 or later and an administrator terminal). Everything else works; relayed players are then placed from their direct stream only, and very high pings can read too low. Run `ds3sm relay-header-test` to check it. |
+| Packet Monitor still running after ds3sm was closed forcibly | Run `pktmon stop` and `pktmon filter remove` in an administrator terminal. |
 
 ## Credits
 

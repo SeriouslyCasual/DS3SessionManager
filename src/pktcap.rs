@@ -1,6 +1,12 @@
-//! Reads relay wrapper headers from received packets with Windows' built-in
-//! packet capture provider (`Microsoft-Windows-NDIS-PacketCapture`, the one
-//! `netsh trace` and `pktmon` use). Windows only; needs administrator rights.
+//! Reads connection metadata from packets with **Windows Packet Monitor**
+//! (`pktmon`, built into Windows), through its ETW provider
+//! `Microsoft-Windows-PktMon`. Windows only; needs administrator rights.
+//!
+//! Why Packet Monitor: the older NDIS capture provider
+//! (`Microsoft-Windows-NDIS-PacketCapture`) delivered no packets at all on the
+//! test PC, not even to Windows' own `netsh trace` or NetEventPacketCapture
+//! sessions, while Packet Monitor captured every UDP packet with none lost
+//! and its events reached ds3sm's own session (self-test, 2026-11-15).
 //!
 //! Unlike the kernel UDP events in `etw.rs`, this provider delivers packet
 //! **bytes**. Only connection metadata is read from them, never game data
@@ -17,8 +23,9 @@
 //! Nothing but [`Seen`] values (time, addresses, credentials, RTT) leaves it.
 //!
 //! Cost control:
-//! - only packet events (event 1001) are enabled, and frames are dropped
-//!   unless they are UDP with one of the formats above;
+//! - Packet Monitor captures UDP only, 128 bytes per packet, at the network
+//!   adapters only ([`Pktmon`]); only its packet event (160) is enabled, and
+//!   frames are dropped unless they carry one of the formats above;
 //! - the monitor watches [`Capture::events`] and stops the capture while the
 //!   PC moves more packets than [`MAX_EVENTS_PER_S`] (a download, say),
 //!   then tries again later.
@@ -40,13 +47,12 @@ use ferrisetw::trace::UserTrace;
 
 use crate::{geo, gturn, valve};
 
-/// `Microsoft-Windows-NDIS-PacketCapture`.
-const PROVIDER: &str = "2ed6006e-4729-4609-b423-3ee7bcd678ef";
-/// "Packet fragment": one event per captured frame (or frame piece).
-const EVENT_FRAGMENT: u16 = 1001;
-/// Media keywords (any of them); the send-path keyword tells the direction.
-const KW_MEDIA: u64 = 0x1 | 0x200 | 0x8000 | 0x1_0000; // 802.3, WWAN, tunnel, 802.11
-const KW_SEND: u64 = 0x1_0000_0000;
+/// `Microsoft-Windows-PktMon` (Windows Packet Monitor).
+const PKTMON_PROVIDER: &str = "4d4f80d9-c8bd-4d73-bb5b-19c90402c5ac";
+/// Packet Monitor's packet event, with the (trimmed) frame in `Payload`.
+const EVENT_PACKET: u16 = 160;
+/// Its keyword for packet payload events.
+const KW_PAYLOAD: u64 = 0x10;
 /// How long a sent check waits for its answer. Beyond the ~487 ms check
 /// interval that limits size-and-timing pairing: Run 1b had answers up to
 /// 2.3 s.
@@ -149,13 +155,13 @@ fn txid(p: &[u8]) -> [u8; 16] {
 /// A running capture session. Stops when dropped.
 pub struct Capture {
     _trace: UserTrace,
+    /// Packet Monitor, if ds3sm started it; stopped after the trace.
+    _pktmon: Option<Pktmon>,
     pub rx: Receiver<Seen>,
     /// Packet events seen (all packets, before any filtering).
     pub events: Arc<AtomicU64>,
     /// Packets that produced a [`Seen`].
     pub wrapped: Arc<AtomicU64>,
-    /// Every event from the provider, of any kind (diagnostics).
-    pub any_events: Arc<AtomicU64>,
 }
 
 fn is_player_ip(ip: std::net::Ipv4Addr) -> bool {
@@ -189,65 +195,136 @@ fn classify(frame: &[u8], t_ns: i128) -> Option<Seen> {
     })
 }
 
-/// How the provider is enabled. The monitor uses [`Config::DEFAULT`];
-/// `ds3sm relay-header-test` tries the variants to find what a PC delivers.
-#[derive(Clone, Copy, Debug)]
-pub struct Config {
-    pub name: &'static str,
-    pub any: u64,
-    pub level: u8,
-    pub id_filter: bool,
+/// Windows Packet Monitor, started and stopped by ds3sm when it isn't
+/// already running (`pktmon.exe`, built into Windows 10 2004 and later).
+///
+/// Started with a UDP-only filter, packets trimmed to [`PKT_SIZE`] bytes, at
+/// the network adapters only (one copy per packet instead of one per stack
+/// layer), and an in-memory log, so it writes nothing while running. If
+/// Packet Monitor was already running (someone else's capture), ds3sm only
+/// listens and leaves it alone. Stopped when this value is dropped.
+pub struct Pktmon {
+    /// Whether ds3sm started it (and so must stop it).
+    owned: bool,
+    /// Whether ds3sm added the UDP filter (and so must remove filters).
+    filtered: bool,
+    log: std::path::PathBuf,
 }
 
-impl Config {
-    pub const DEFAULT: Config = Config {
-        name: "media keywords, verbose, packet events only",
-        any: KW_MEDIA,
-        level: 5,
-        id_filter: true,
-    };
-    /// The variants the self-test tries, the default first.
-    pub const VARIANTS: [Config; 4] = [
-        Config::DEFAULT,
-        Config {
-            name: "media keywords, verbose, no event filter",
-            any: KW_MEDIA,
-            level: 5,
-            id_filter: false,
-        },
-        Config {
-            name: "all keywords, verbose, no event filter",
-            any: u64::MAX,
-            level: 5,
-            id_filter: false,
-        },
-        Config {
-            name: "all keywords, informational, no event filter",
-            any: u64::MAX,
-            level: 4,
-            id_filter: false,
-        },
-    ];
+/// Bytes kept per packet: enough for IP/UDP headers, the relay header and a
+/// 68-byte check answer, never much of the game's own data.
+const PKT_SIZE: u32 = 128;
+
+fn pktmon(args: &[&str]) -> Result<String> {
+    let out = std::process::Command::new("pktmon")
+        .args(args)
+        .output()
+        .context("running pktmon (Windows Packet Monitor)")?;
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        let why = [err.as_ref(), text.as_str()]
+            .iter()
+            .flat_map(|t| t.lines())
+            .rfind(|l| !l.trim().is_empty())
+            .unwrap_or("failed")
+            .trim()
+            .to_owned();
+        return Err(anyhow!("pktmon {}: {why}", args.join(" ")));
+    }
+    Ok(text)
 }
 
+impl Pktmon {
+    pub fn start() -> Result<Self> {
+        // Fails without administrator rights ("Access is denied"). A "not
+        // running" answer may come with a failure code; that's no error.
+        let status = match pktmon(&["status"]) {
+            Err(e) if e.to_string().contains("not running") => String::new(),
+            r => r?,
+        };
+        let log = std::env::temp_dir().join(format!("ds3sm-pktmon-{}.etl", std::process::id()));
+        if status.contains("is running") || status.contains("Logger name") {
+            return Ok(Self {
+                owned: false,
+                filtered: false,
+                log,
+            });
+        }
+        let filters = match pktmon(&["filter", "list"]) {
+            Err(e) if e.to_string().contains("No filters") => String::new(),
+            r => r?,
+        };
+        let filtered = filters.contains("No filters") || filters.trim().is_empty();
+        if filtered {
+            pktmon(&["filter", "add", "ds3sm", "-t", "UDP"])?;
+        }
+        let size = PKT_SIZE.to_string();
+        let file = log.to_string_lossy().into_owned();
+        let started = pktmon(&[
+            "start",
+            "--capture",
+            "--comp",
+            "nics",
+            "--pkt-size",
+            &size,
+            "--log-mode",
+            "memory",
+            "--file-size",
+            "16",
+            "--file-name",
+            &file,
+        ]);
+        if let Err(e) = started {
+            if filtered {
+                let _ = pktmon(&["filter", "remove"]);
+            }
+            return Err(e);
+        }
+        Ok(Self {
+            owned: true,
+            filtered,
+            log,
+        })
+    }
+
+    /// Whether ds3sm started Packet Monitor itself.
+    pub fn owned(&self) -> bool {
+        self.owned
+    }
+}
+
+impl Drop for Pktmon {
+    fn drop(&mut self) {
+        if self.owned {
+            let _ = pktmon(&["stop"]);
+            let _ = std::fs::remove_file(&self.log);
+        }
+        if self.filtered {
+            let _ = pktmon(&["filter", "remove"]);
+        }
+    }
+}
+
+/// Start Packet Monitor (unless it is running already) and read its packets.
 pub fn start() -> Result<Capture> {
-    start_with(Config::DEFAULT)
+    let pm = Pktmon::start()?;
+    let mut c = listen()?;
+    c._pktmon = Some(pm);
+    Ok(c)
 }
 
-pub fn start_with(cfg: Config) -> Result<Capture> {
+/// Read Packet Monitor's packet events in this program's own ETW session.
+/// Packet Monitor must be capturing (see [`Pktmon`]); its provider writes
+/// each captured packet to every session that enables it.
+pub fn listen() -> Result<Capture> {
     let (tx, rx) = channel();
     let events = Arc::new(AtomicU64::new(0));
     let found = Arc::new(AtomicU64::new(0));
-    let any_events = Arc::new(AtomicU64::new(0));
-    let (ev, fd, ae) = (
-        Arc::clone(&events),
-        Arc::clone(&found),
-        Arc::clone(&any_events),
-    );
+    let (ev, fd) = (Arc::clone(&events), Arc::clone(&found));
     let mut pairer = Pairer::default();
     let callback = move |record: &EventRecord, locator: &SchemaLocator| {
-        ae.fetch_add(1, Ordering::Relaxed);
-        if record.event_id() != EVENT_FRAGMENT {
+        if record.event_id() != EVENT_PACKET {
             return;
         }
         ev.fetch_add(1, Ordering::Relaxed);
@@ -255,143 +332,85 @@ pub fn start_with(cfg: Config) -> Result<Capture> {
             return;
         };
         let p = Parser::create(record, &schema);
-        let Ok(frame) = p.try_parse::<Vec<u8>>("Fragment") else {
+        let Ok(frame) = p.try_parse::<Vec<u8>>("Payload") else {
             return;
         };
         let t_ns = (record.raw_timestamp() - FILETIME_UNIX_EPOCH) as i128 * 100;
-        if record.keyword() & KW_SEND != 0 {
+        let Some(u) = gturn::frame_udp(&frame) else {
+            return;
+        };
+        // Direction from the addresses: this PC sits behind a home router,
+        // so its own side is a private address. (A PC with a public address
+        // of its own isn't supported by the exact features yet.)
+        if geo::is_non_public((*u.src.ip()).into()) {
             pairer.sent(&frame, t_ns);
             return;
         }
-        let rtt = gturn::frame_udp(&frame).and_then(|u| pairer.answered(&u, t_ns));
+        let rtt = pairer.answered(&u, t_ns);
         for seen in [classify(&frame, t_ns), rtt].into_iter().flatten() {
             fd.fetch_add(1, Ordering::Relaxed);
             let _ = tx.send(seen);
         }
     };
-    let mut provider = Provider::by_guid(PROVIDER).any(cfg.any).level(cfg.level);
-    if cfg.id_filter {
-        provider = provider.add_filter(EventFilter::ByEventIds(vec![EVENT_FRAGMENT]));
-    }
-    let provider = provider.add_callback(callback).build();
+    let provider = Provider::by_guid(PKTMON_PROVIDER)
+        .any(KW_PAYLOAD)
+        .level(4)
+        .add_filter(EventFilter::ByEventIds(vec![EVENT_PACKET]))
+        .add_callback(callback)
+        .build();
     let trace = UserTrace::new()
-        .named(format!("ds3sm-relayhdr-{}", std::process::id()))
+        .named(format!("ds3sm-pktmon-{}", std::process::id()))
         .enable(provider)
         .start_and_process()
         .map_err(|e| anyhow!("{e:?}"))
-        .context("starting the NDIS packet capture trace (run as administrator)")?;
+        .context("reading Packet Monitor's events (run as administrator)")?;
     Ok(Capture {
         _trace: trace,
+        _pktmon: None,
         rx,
         events,
         wrapped: found,
-        any_events,
     })
 }
 
-/// `ds3sm relay-header-test`: start the capture each way in
-/// [`Config::VARIANTS`] for a few seconds while sending small UDP packets to a
-/// TEST-NET address (RFC 5737, routed nowhere), and report what arrived.
-/// Shows whether this PC's packet capture delivers events at all, and how it
-/// has to be enabled.
+/// `ds3sm relay-header-test`: start the capture as the monitor does for a
+/// few seconds while sending small UDP packets to a TEST-NET address
+/// (RFC 5737, routed nowhere), and report what arrived. A control provider
+/// shows whether this program's event session works at all.
 pub fn self_test() -> Result<()> {
     let sock = std::net::UdpSocket::bind("0.0.0.0:0")?;
     let target = SocketAddrV4::new(std::net::Ipv4Addr::new(192, 0, 2, 1), 50002);
-    println!("relay header self-test: {} s per variant", TEST_SECS);
-    println!(
-        "{:<48} {:>10} {:>14} {:>10}",
-        "variant", "events", "packet events", "useful"
-    );
-    for cfg in Config::VARIANTS {
-        let line = match start_with(cfg) {
-            Ok(c) => {
-                let end = std::time::Instant::now() + std::time::Duration::from_secs(TEST_SECS);
-                while std::time::Instant::now() < end {
-                    let _ = sock.send_to(&[0u8; 37], target);
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                }
-                while c.rx.try_recv().is_ok() {}
-                format!(
-                    "{:<48} {:>10} {:>14} {:>10}",
-                    cfg.name,
-                    c.any_events.load(Ordering::Relaxed),
-                    c.events.load(Ordering::Relaxed),
-                    c.wrapped.load(Ordering::Relaxed)
-                )
-            }
-            Err(e) => format!("{:<48} failed: {e:#}", cfg.name),
-        };
-        println!("{line}");
-    }
-    // Packet Monitor's provider (needs `pktmon start --capture` running):
-    // events, event IDs, and how many carry a decodable UDP frame in their
-    // `Payload` field.
-    let pktmon = (|| -> Result<String> {
-        let ids: Arc<std::sync::Mutex<HashMap<u16, u64>>> = Arc::default();
-        let frames = Arc::new(AtomicU64::new(0));
-        let fields = Arc::new(std::sync::Mutex::new(None::<String>));
-        let (i2, f2, fl2) = (Arc::clone(&ids), Arc::clone(&frames), Arc::clone(&fields));
-        let provider = Provider::by_guid(PKTMON_PROVIDER)
-            .any(u64::MAX)
-            .level(5)
-            .add_callback(move |r: &EventRecord, loc: &SchemaLocator| {
-                if let Ok(mut m) = i2.lock() {
-                    *m.entry(r.event_id()).or_default() += 1;
-                }
-                let Ok(schema) = loc.event_schema(r) else {
-                    return;
-                };
-                let p = Parser::create(r, &schema);
-                if let Ok(f) = p.try_parse::<Vec<u8>>("Payload") {
-                    if gturn::frame_udp(&f).is_some() {
-                        f2.fetch_add(1, Ordering::Relaxed);
-                    }
-                    if let Ok(mut g) = fl2.lock()
-                        && g.is_none()
-                    {
-                        *g = Some(format!("event {} payload {} B", r.event_id(), f.len()));
-                    }
-                }
-            })
-            .build();
-        let _trace = UserTrace::new()
-            .named(format!("ds3sm-pktmon-{}", std::process::id()))
-            .enable(provider)
-            .start_and_process()
-            .map_err(|e| anyhow!("{e:?}"))?;
-        let end = std::time::Instant::now() + std::time::Duration::from_secs(TEST_SECS);
+    let pump = |secs: u64| {
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(secs);
         while std::time::Instant::now() < end {
             let _ = sock.send_to(&[0u8; 37], target);
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
-        let mut top: Vec<(u16, u64)> = ids
-            .lock()
-            .map(|m| m.clone().into_iter().collect())
-            .unwrap_or_default();
-        top.sort_by_key(|a| std::cmp::Reverse(a.1));
-        top.truncate(4);
-        let total: u64 = ids.lock().map(|m| m.values().sum()).unwrap_or(0);
-        Ok(format!(
-            "{:<48} {:>10} {:>14}   ids {:?}; first {}",
-            "Packet Monitor provider (pktmon running?)",
-            total,
-            frames.load(Ordering::Relaxed),
-            top,
-            fields
-                .lock()
-                .ok()
-                .and_then(|g| g.clone())
-                .unwrap_or_else(|| "-".into())
-        ))
-    })();
-    match pktmon {
-        Ok(s) => println!("{s}"),
-        Err(e) => println!("{:<48} failed: {e:#}", "Packet Monitor provider"),
+    };
+    println!("relay header self-test: {TEST_SECS} s each");
+    println!("{:<44} {:>14} {:>10}", "source", "packet events", "useful");
+    match start() {
+        Ok(c) => {
+            let owned = c._pktmon.as_ref().is_some_and(Pktmon::owned);
+            pump(TEST_SECS);
+            let mut useful = 0;
+            while c.rx.try_recv().is_ok() {
+                useful += 1;
+            }
+            println!(
+                "{:<44} {:>14} {:>10}",
+                if owned {
+                    "Packet Monitor (started by ds3sm)"
+                } else {
+                    "Packet Monitor (already running)"
+                },
+                c.events.load(Ordering::Relaxed),
+                useful
+            );
+        }
+        Err(e) => println!("{:<44} failed: {e:#}", "Packet Monitor"),
     }
-
-    // Control: a built-in provider that always logs network events. If it
-    // counts events while the capture provider counts none, this program's
-    // event session works and the capture provider needs switching on.
+    // Control: a built-in provider that always logs network events.
     let control = (|| -> Result<u64> {
         let n = Arc::new(AtomicU64::new(0));
         let n2 = Arc::clone(&n);
@@ -407,19 +426,15 @@ pub fn self_test() -> Result<()> {
             .enable(provider)
             .start_and_process()
             .map_err(|e| anyhow!("{e:?}"))?;
-        let end = std::time::Instant::now() + std::time::Duration::from_secs(TEST_SECS);
-        while std::time::Instant::now() < end {
-            let _ = sock.send_to(&[0u8; 37], target);
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
+        pump(TEST_SECS);
         Ok(n.load(Ordering::Relaxed))
     })();
     match control {
-        Ok(n) => println!("{:<48} {:>10}", "control: Microsoft-Windows-TCPIP", n),
-        Err(e) => println!("{:<48} failed: {e:#}", "control: Microsoft-Windows-TCPIP"),
+        Ok(n) => println!("{:<44} {:>14}", "control: Microsoft-Windows-TCPIP", n),
+        Err(e) => println!("{:<44} failed: {e:#}", "control: Microsoft-Windows-TCPIP"),
     }
     println!(
-        "\n'packet events' should be well above 0 (this test alone sends {} packets).",
+        "\n'packet events' should be well above 0 (this test alone sends {} UDP packets).",
         TEST_SECS * 10
     );
     println!("'useful' counts Steam checks and relay headers, so it is 0 unless Steam is talking.");
@@ -427,8 +442,6 @@ pub fn self_test() -> Result<()> {
 }
 
 const TEST_SECS: u64 = 6;
-/// `Microsoft-Windows-PktMon` (Windows Packet Monitor).
-const PKTMON_PROVIDER: &str = "4d4f80d9-c8bd-4d73-bb5b-19c90402c5ac";
 /// `Microsoft-Windows-TCPIP`, the self-test's control provider.
 const TCPIP_PROVIDER: &str = "2f07e2ee-15db-40f1-90ef-9d7ba282188a";
 

@@ -53,7 +53,7 @@ mod etw; // kernel packet tracing (Event Tracing for Windows)
 #[cfg(windows)]
 mod monitor; // the `probe` and `monitor` commands (main loop)
 #[cfg(windows)]
-mod ndiscap; // reads relay wrapper headers from received packets
+mod pktcap; // Windows Packet Monitor: relay headers, session IDs, exact ping
 #[cfg(windows)]
 mod steam; // talks to the local Steam client
 #[cfg(windows)]
@@ -269,7 +269,7 @@ fn main() -> Result<()> {
         #[cfg(windows)]
         Cmd::Monitor(args) => monitor::run(args),
         #[cfg(windows)]
-        Cmd::RelayHeaderTest => ndiscap::self_test(),
+        Cmd::RelayHeaderTest => pktcap::self_test(),
         // On non-Windows builds the two arms above don't exist, so this
         // catch-all keeps the `match` exhaustive.
         #[cfg(not(windows))]

@@ -32,7 +32,7 @@ use crate::etw::{self, ByteOrder};
 use crate::geo::{self, AsnDb, GeoDb, GeoInfo, LatLon, NetKind};
 use crate::jitter::StreamJitter;
 use crate::model::{P2PState, Provenance, RttSample, RttSource, SteamId};
-use crate::ndiscap;
+use crate::pktcap;
 use crate::playerip::{self, Sighting, Source};
 use crate::relay::{self, Detectors, Evidence, Role};
 use crate::stats::Rolling;
@@ -688,7 +688,7 @@ pub fn run(args: MonitorArgs) -> Result<()> {
         store.set_meta("tcp_fallback", "on")?;
     }
     // Relayed players' own addresses (`playerip.rs`): direct streams from ETW,
-    // plus relay wrapper headers (`ndiscap.rs`, on unless
+    // plus relay wrapper headers (`pktcap.rs`, on unless
     // `--no-relay-header`).
     let mut players = playerip::Matcher::default();
     let mut hdr = RelayHeader::new(!args.no_relay_header && trace.is_some(), &store)?;
@@ -964,12 +964,12 @@ pub fn run(args: MonitorArgs) -> Result<()> {
 /// player's statistics (checks come every ~0.5–1 s).
 const EXACT_HOLD_NS: i128 = 5_000_000_000;
 
-/// Relay wrapper header reading (`ndiscap.rs`), with its cost guard: while
-/// the PC receives more than `ndiscap::MAX_EVENTS_PER_S` packets a second,
+/// Relay wrapper header reading (`pktcap.rs`), with its cost guard: while
+/// the PC receives more than `pktcap::MAX_EVENTS_PER_S` packets a second,
 /// the capture is stopped, and started again [`HDR_RETRY`] later.
 struct RelayHeader {
     enabled: bool,
-    cap: Option<ndiscap::Capture>,
+    cap: Option<pktcap::Capture>,
     paused_until: Option<Instant>,
     last: (Instant, u64),
     /// Totals over the run, logged at the end.
@@ -1004,7 +1004,7 @@ impl RelayHeader {
     }
 
     fn start(&mut self, store: &Store) -> Result<()> {
-        match ndiscap::start() {
+        match pktcap::start() {
             Ok(c) => {
                 self.cap = Some(c);
                 self.last = (Instant::now(), 0);
@@ -1033,7 +1033,7 @@ impl RelayHeader {
         let Some(c) = &self.cap else { return Ok(()) };
         while let Ok(seen) = c.rx.try_recv() {
             match seen {
-                ndiscap::Seen::Wrapped { t_ns, player } => {
+                pktcap::Seen::Wrapped { t_ns, player } => {
                     let s = Sighting {
                         ep: player,
                         t_ns,
@@ -1043,17 +1043,17 @@ impl RelayHeader {
                         store.insert_player_seen(t_ns, player, Source::Wrapper.as_str())?;
                     }
                 }
-                ndiscap::Seen::RelayCred { relay, cred } => {
+                pktcap::Seen::RelayCred { relay, cred } => {
                     if let [id] = reporters(peers, relay)[..] {
                         players.relay_credential(id, cred);
                     }
                 }
-                ndiscap::Seen::PlayerCred { t_ns, player, cred } => {
+                pktcap::Seen::PlayerCred { t_ns, player, cred } => {
                     if players.player_credential(player, cred, t_ns) {
                         store.insert_player_seen(t_ns, player, Source::Credential.as_str())?;
                     }
                 }
-                ndiscap::Seen::Rtt {
+                pktcap::Seen::Rtt {
                     t_ns,
                     remote,
                     cred,
@@ -1097,7 +1097,7 @@ impl RelayHeader {
                 let n = c.events.load(Ordering::Relaxed);
                 let rate = (n - self.last.1) as f64 / el.as_secs_f64();
                 self.last = (Instant::now(), n);
-                if rate > ndiscap::MAX_EVENTS_PER_S as f64 {
+                if rate > pktcap::MAX_EVENTS_PER_S as f64 {
                     self.tally();
                     self.cap = None;
                     self.paused_until = Some(Instant::now() + HDR_RETRY);
