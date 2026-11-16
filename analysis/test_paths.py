@@ -35,7 +35,7 @@ CREATE TABLE traffic (t_ns INTEGER, steam_id INTEGER, remote_ip TEXT, remote_por
 """
 
 
-def make_run(path: str, peer_ip: str = LAN, geo: tuple | None = None) -> None:
+def make_run(path: str, peer_ip: str = LAN, geo: tuple | None = None, pps: float = 18.0) -> None:
     """Direct 0-60 s (1 ms), relay 60-120 s (20 ms, 10 % no-reply), TCP 120-180 s (40 ms), direct port 2 180-240 s."""
     db = sqlite3.connect(path)
     db.executescript(SCHEMA)
@@ -82,7 +82,7 @@ def make_run(path: str, peer_ip: str = LAN, geo: tuple | None = None) -> None:
                 "INSERT INTO traffic (t_ns, steam_id, remote_ip, remote_port, role, pps_in, pps_out, pkts_in, "
                 "pkts_out, bytes_in, bytes_out, max_gap_in_ms, jit_in_ms, stun_req, stun_matched, stun_lost) "
                 "VALUES (?,?,?,?,?,?,?,0,0,0,0,0,?,?,?,0)",
-                (t, PEER, req_ep[0], req_ep[1], "peer", 18.0, 36.0, jit, req, mat),
+                (t, PEER, req_ep[0], req_ep[1], "peer", pps, 36.0, jit, req, mat),
             )
             # A quieter second endpoint of the same peer must not supply the jitter.
             db.execute(
@@ -174,6 +174,21 @@ class Episodes(unittest.TestCase):
         infl = paths.inflation(eps, {(run, k): v for k, v in geo.items()}, (49.0, -122.9), 10)
         self.assertAlmostEqual(infl[0]["distance_km"], paths.great_circle_km(49, -122.9, 49, -123), places=6)
         self.assertTrue(infl[0]["coarse"])  # 20 km accuracy vs ~7 km distance
+
+    def test_no_jitter_without_a_game_rate_stream(self):
+        # Only check replies (~2/s) attributed: RTT stays, jitter is withheld.
+        make_run(self.db, pps=2.0)
+        _, eps, _ = paths.load_run(self.db, 5 * S)
+        r = eps[1].stats
+        self.assertAlmostEqual(r["rtt_p50"], 22.0)
+        self.assertIsNone(r["jit_in_ms"])
+        self.assertEqual(r["game_stream_share"], 0.0)
+
+    def test_unknown_accuracy_is_not_called_precise(self):
+        make_run(self.db, peer_ip=WAN, geo=("CA", "X", 49.0, -123.0, None, 1000.0, 10.007))
+        run, eps, geo = paths.load_run(self.db, 5 * S)
+        infl = paths.inflation(eps, {(run, k): v for k, v in geo.items()}, None, 10)
+        self.assertIsNone(infl[0]["coarse"])
 
     def test_main_writes_pseudonymised_json(self):
         make_run(self.db)

@@ -22,7 +22,7 @@ episode are skipped for the statistics (path transitions are noisy).
 
 Per episode: RTT minimum, median and p95 (ETW STUN samples, or TCP's own
 samples on the fallback), the median inbound jitter of the peer's dominant
-inbound stream, the STUN no-reply share (`nrep`) with a 95 % Wilson interval,
+inbound stream (only when it runs at game rate, >= 5 packets/s), the STUN no-reply share (`nrep`) with a 95 % Wilson interval,
 and the median inbound packets/s.
 
 E4 (relay cost): for each peer seen on more than one path kind in a run, the
@@ -33,7 +33,8 @@ with a geolocation, the great-circle distance, the fiber bound (2/3 c, there
 and back) and the inflation ratio `min RTT / bound` (and `median / bound`).
 The bound comes from the run's `geo` table, or is recomputed from the stored
 coordinates when `--home-lat/--home-lon` are given. A geolocation whose
-accuracy radius exceeds half the distance is flagged `coarse`.
+accuracy radius exceeds half the distance is flagged `coarse`, and `acc?` when
+the database gives no radius (DB-IP Lite doesn't).
 
 Privacy: Steam IDs are shown as salted SHA-256 pseudonyms (the same
 construction as ds3sm's export; the salt is random per invocation unless
@@ -59,6 +60,11 @@ C_KM_S = 299_792.458
 FIBER_FRACTION = 2.0 / 3.0
 EARTH_RADIUS_KM = 6_371.0088
 S = 1_000_000_000
+# Game-rate inbound packets/s (ds3sm's MIN_RELAY_PPS). Below it the dominant
+# inbound stream is only Steam's check replies (~2/s): seen for relayed peers
+# whose game stream arrives through a relay endpoint shared with other peers,
+# which ds3sm can't attribute. Their jitter isn't the game stream's.
+GAME_PPS = 5.0
 
 EVIDENCE = re.compile(r"^(\d+) .*\brelayed=([01]) remote=(\S+)$")
 ID_REMOTE = re.compile(r"^(\d+) (\S+)$")
@@ -287,7 +293,9 @@ def episode_stats(db: sqlite3.Connection, ep: Episode, settle_ns: int) -> dict:
         if r[0] not in best or r[3] > best[r[0]][3]:
             best[r[0]] = r
     d["pps_in"] = med([r[3] for r in best.values()])
-    d["jit_in_ms"] = med([r[4] for r in best.values() if r[4] is not None])
+    game = [r for r in best.values() if r[3] >= GAME_PPS]
+    d["jit_in_ms"] = med([r[4] for r in game if r[4] is not None])
+    d["game_stream_share"] = len(game) / len(best) if best else 0.0
     # On the TCP fallback Steam's UDP checks go unanswered by design, so their
     # no-reply share says nothing about the path in use.
     if {"stun_req", "stun_matched"} <= cols and ep.path != "tcp":
@@ -402,7 +410,8 @@ def inflation(eps: list[Episode], geo: dict[tuple[str, int], dict], home: tuple[
         p["inflation_min"] = p["rtt_min"] / p["bound_ms"]
         p["inflation_p50"] = p50 / p["bound_ms"]
         acc = p["accuracy_km"]
-        p["coarse"] = bool(acc is not None and p["distance_km"] and acc > p["distance_km"] / 2)
+        # None = the database gives no accuracy radius (DB-IP Lite doesn't).
+        p["coarse"] = None if acc is None else bool(p["distance_km"] and acc > p["distance_km"] / 2)
         out.append(p)
     out.sort(key=lambda r: r["distance_km"] or 0)
     return out
@@ -444,14 +453,15 @@ def print_report(eps: list[Episode], cost: list[dict], infl: list[dict], name) -
         return
     print(f"  {'peer':<12} {'cc':<3} {'km':>7} {'bound':>7} {'min':>7} {'p50':>7} {'x min':>6} {'x p50':>6}  note")
     for r in infl:
-        note = "coarse" if r["coarse"] else ""
+        note = {True: "coarse", False: "", None: "acc?"}[r["coarse"]]
         print(f"  {name(r['peer']):<12} {r['country'] or '-':<3} {_f(r['distance_km'], 0):>7} "
               f"{_f(r['bound_ms']):>7} {_f(r['rtt_min']):>7} {_f(r['rtt_p50']):>7} "
               f"{_f(r['inflation_min'], 2):>6} {_f(r['inflation_p50'], 2):>6}  {note}")
-    xs = [r["inflation_min"] for r in infl if not r["coarse"]]
+    xs = [r["inflation_min"] for r in infl if r["coarse"] is not True]
+    unknown = sum(1 for r in infl if r["coarse"] is None)
     if xs:
-        print(f"  inflation (min RTT / bound), {len(xs)} peers not coarse: median {med(xs):.2f}, "
-              f"p25 {pct(xs, 0.25):.2f}, p75 {pct(xs, 0.75):.2f}")
+        print(f"  inflation (min RTT / bound), {len(xs)} peers ({unknown} with no accuracy radius): "
+              f"median {med(xs):.2f}, p25 {pct(xs, 0.25):.2f}, p75 {pct(xs, 0.75):.2f}")
 
 
 def main(argv: list[str] | None = None) -> int:
