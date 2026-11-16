@@ -977,7 +977,7 @@ struct RelayHeader {
     wrapped: u64,
 }
 
-const HDR_RETRY: Duration = Duration::from_secs(120);
+const HDR_RETRY: Duration = Duration::from_secs(30);
 
 impl RelayHeader {
     fn new(enabled: bool, store: &Store) -> Result<Self> {

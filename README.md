@@ -115,7 +115,7 @@ Steam doesn't always say when it relays a connection, so ds3sm treats a player a
 | Steam says the game is already running | Close `ds3sm` before starting the game. Always start the game first. |
 | No players listed | You need to be in a multiplayer session (summoned, summoning or invaded). |
 | Ping column empty | Run `probe` and include its output when you report the issue. |
-| `relay header reading: paused (heavy traffic)` | Your PC is receiving a lot of data (a download, say). Reading relay headers pauses to keep the cost low and tries again two minutes later. |
+| `relay header reading: paused (heavy traffic)` | Your PC is receiving a lot of data (a download, say). Reading relay headers pauses to keep the cost low and tries again 30 seconds later. |
 | `relay header reading: off` with a note at startup | Windows Packet Monitor couldn't start (it needs Windows 10 version 2004 or later and an administrator terminal). Everything else works; relayed players are then placed from their direct stream only, and very high pings can read too low. Run `ds3sm relay-header-test` to check it. |
 | Packet Monitor still running after ds3sm was closed forcibly | Run `pktmon stop` and `pktmon filter remove` in an administrator terminal. |
 

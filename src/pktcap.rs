@@ -59,8 +59,12 @@ const KW_PAYLOAD: u64 = 0x10;
 const MAX_WAIT_NS: i128 = 5_000_000_000;
 /// Bound on checks waiting for an answer (old ones are dropped first).
 const MAX_PENDING: usize = 4096;
-/// Packet events per second above which the capture is paused.
-pub const MAX_EVENTS_PER_S: u64 = 5_000;
+/// UDP packet events per second above which the capture is paused. Run 1d
+/// (2026-11-16) averaged ~830/s with brief bursts to 9,000–15,000/s from
+/// other programs' UDP (Steam's own peaked under 100/s), which a 5,000 limit
+/// paused for minutes at a time. The callback's per-packet work is small; the
+/// limit only stops runaway cost (a large UDP download, say).
+pub const MAX_EVENTS_PER_S: u64 = 30_000;
 /// FILETIME of the Unix epoch, in 100 ns units (as in `etw.rs`).
 const FILETIME_UNIX_EPOCH: i64 = 116_444_736_000_000_000;
 
