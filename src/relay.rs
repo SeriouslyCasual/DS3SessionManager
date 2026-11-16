@@ -30,10 +30,11 @@
 //! - **F**, Steam's flag: `using_relay`.
 //! - **P**, traffic asymmetry (no lists involved): Steam's remote carries our
 //!   game-rate sends but almost nothing back (only the ~2/s STUN replies),
-//!   while another steam.exe endpoint receives game-rate inbound traffic. A
-//!   direct peer sends its ~20/s back on the same endpoint. Never fires for
-//!   a remote on a private or other local address: relays are public, and a
-//!   LAN peer can answer from a sibling port.
+//!   while a relay address receives game-rate inbound traffic. A direct
+//!   peer sends its ~20/s back on the same endpoint. Never fires for a
+//!   remote on a private or other local address (relays are public, and a
+//!   LAN peer can answer from a sibling port), nor while another live peer
+//!   is relayed (their streams share the nearby relay endpoint).
 //! - **A**, ASN database: the optional DB-IP ASN file says the remote IP
 //!   belongs to Valve's network (AS32590).
 //! - **L**, built-in list: the remote IP is in Valve's announced address
@@ -47,12 +48,12 @@
 //!
 //! While **exactly one** live peer is relayed, every steam.exe endpoint
 //! that no other peer claims and that looks like part of the session counts
-//! for it ([`relay_set`]): a relay address (lists or ASN) or an endpoint
-//! receiving game-rate inbound traffic, at game rate, on any host or site.
+//! for it ([`relay_set`]): a relay address (lists or ASN) at game rate, on
+//! any host or site, that doesn't carry its own 56/68-byte checks.
 //! With several relayed peers nothing is attributed: their relay traffic
 //! can't be told apart without the packet contents. In E1 mode, where
 //! Steam's remote carries no packets, [`pick`] also finds the busiest
-//! game-like endpoint.
+//! game-like endpoint on a relay address.
 //!
 //! The "relay host" shown and placed (`relay_ip` in the monitor) is the one
 //! carrying the RTT: Steam's remote in E2 mode, the picked endpoint in E1.
@@ -251,8 +252,10 @@ impl Candidate {
     }
 }
 
-/// E1-mode rule: the busiest game-like steam.exe endpoint, only when exactly
-/// one peer needs it. `flag_only_peers` counts live peers Steam flags as
+/// E1-mode rule: the busiest game-like steam.exe endpoint on a relay address,
+/// only when exactly one peer needs it. Relay traffic always comes from a
+/// relay address (online run 1: without this rule, another player's direct
+/// endpoint not yet reported by Steam was picked). `flag_only_peers` counts live peers Steam flags as
 /// relayed whose reported remote isn't a relay; `claimed` holds endpoints
 /// Steam reports for peers.
 pub fn pick(
@@ -265,7 +268,7 @@ pub fn pick(
     }
     candidates
         .iter()
-        .filter(|c| c.looks_like_game() && !claimed.contains(&c.ep))
+        .filter(|c| c.relay_addr && c.looks_like_game() && !claimed.contains(&c.ep))
         .max_by(|a, b| a.pps.total_cmp(&b.pps))
         .map(|c| c.ep)
 }
@@ -284,9 +287,15 @@ pub fn is_local_address(ip: Ipv4Addr) -> bool {
 }
 
 /// Detector P: Steam's remote carries our game-rate sends but almost nothing
-/// back, while another endpoint receives game-rate inbound traffic.
-/// `claimed` holds endpoints Steam reports for *other* peers, which never
-/// count as that other endpoint.
+/// back, while a relay address receives game-rate inbound traffic.
+/// `claimed` holds endpoints Steam reports for, or ds3sm attributed to,
+/// *other* peers, which never count as that other endpoint.
+///
+/// P stays silent while another live peer is relayed (`others_relayed`):
+/// every relayed peer's inbound stream then arrives on the same nearby relay
+/// endpoint, so it can't be evidence for this one. Online run 1: a direct
+/// peer whose inbound rate dipped for a second fired P from another relayed
+/// peer's stream. The other detectors still decide in that case.
 ///
 /// A remote on a local address never fires P. On a LAN, after Steam returns
 /// from its TCP fallback (E3), the peer can answer from a sibling socket:
@@ -296,8 +305,9 @@ pub fn pattern(
     remote: SocketAddrV4,
     candidates: &[Candidate],
     claimed: &HashSet<SocketAddrV4>,
+    others_relayed: bool,
 ) -> bool {
-    if is_local_address(*remote.ip()) {
+    if others_relayed || is_local_address(*remote.ip()) {
         return false;
     }
     let Some(r) = candidates.iter().find(|c| c.ep == remote) else {
@@ -307,6 +317,7 @@ pub fn pattern(
         && r.pps_in <= ASYM_MAX_IN_PPS
         && candidates.iter().any(|c| {
             c.ep != remote
+                && c.relay_addr
                 && c.ep.port() != STUN_SERVER_PORT
                 && c.pps_in >= GAME_IN_PPS
                 && !claimed.contains(&c.ep)
@@ -322,8 +333,14 @@ pub const STUN_SERVER_PORT: u16 = 3478;
 /// The endpoints that count for the one relayed peer, besides Steam's own
 /// reported remote (`exclude`). Call it only when exactly one live peer is
 /// relayed. An endpoint qualifies if no other peer claims it, it isn't the
-/// STUN server port, and it's part of the session: a relay address (lists
-/// or ASN) or an endpoint receiving game-rate inbound traffic, at game rate.
+/// STUN server port, it's a relay address (lists or ASN), and it runs at
+/// game rate. An unlisted endpoint receiving game-rate traffic no longer
+/// counts: online, those were other players' direct endpoints and unrelated
+/// steam.exe streams (run 1), and the partner-hosted relay sites are in the
+/// built-in list. An endpoint carrying its own 56/68-byte checks doesn't
+/// count either: a session has one check endpoint (Steam's remote, or
+/// `e1_pick`), so another one is a different relayed peer's, seen while
+/// that peer joins or leaves (run 1: its RTT samples landed on this peer).
 /// Endpoints already attributed (`previous`) stay while they carry any
 /// traffic, so a short dip below game rate doesn't flap the attribution.
 /// `e1_pick` (E1 mode) is always included. Sorted, so comparing with the
@@ -341,7 +358,8 @@ pub fn relay_set(
             Some(c.ep) != exclude
                 && c.ep.port() != STUN_SERVER_PORT
                 && !claimed.contains(&c.ep)
-                && (c.relay_addr || c.pps_in >= GAME_IN_PPS)
+                && c.relay_addr
+                && !c.stun_like
                 && (c.pps >= MIN_RELAY_PPS || (previous.contains(&c.ep) && c.pps > 0.0))
         })
         .map(|c| c.ep)
@@ -404,7 +422,7 @@ mod tests {
     }
 
     fn c(last: u8, pps: f64, stun_like: bool) -> Candidate {
-        Candidate::new(ep(last, 4380), pps / 2.0, pps / 2.0, stun_like, false)
+        Candidate::new(ep(last, 4380), pps / 2.0, pps / 2.0, stun_like, true)
     }
 
     /// A candidate with per-direction rates.
@@ -430,6 +448,19 @@ mod tests {
         let cands = [c(2, 60.0, true), c(4, 40.0, true)];
         let claimed: HashSet<_> = [ep(2, 4380)].into();
         assert_eq!(pick(1, &cands, &claimed), Some(ep(4, 4380)));
+    }
+
+    #[test]
+    fn only_relay_addresses_are_picked() {
+        // Online run 1: another player's direct endpoint (not a relay
+        // address, not yet reported by Steam) must not be picked.
+        let direct = cd(ep(9, 36696), 18.0, 17.0, true, false);
+        assert_eq!(pick(1, &[direct], &HashSet::new()), None);
+        let relay = cd(ep(148, 4380), 32.0, 50.0, true, true);
+        assert_eq!(
+            pick(1, &[direct, relay], &HashSet::new()),
+            Some(ep(148, 4380))
+        );
     }
 
     #[test]
@@ -492,7 +523,10 @@ mod tests {
                 cd(reported, 2.0, 33.0, true, true),
                 cd(wrapped, 20.0, 2.0, false, true),
             ];
-            assert!(pattern(reported, &cands, &HashSet::new()), "{wrapped}");
+            assert!(
+                pattern(reported, &cands, &HashSet::new(), false),
+                "{wrapped}"
+            );
         }
     }
 
@@ -502,23 +536,48 @@ mod tests {
         // A direct peer: ~19/s comes back on the same endpoint.
         let direct = cd(reported, 19.0, 37.0, true, false);
         let busy_other = cd(ep(16, 50000), 20.0, 2.0, false, false);
-        assert!(!pattern(reported, &[direct, busy_other], &HashSet::new()));
+        assert!(!pattern(
+            reported,
+            &[direct, busy_other],
+            &HashSet::new(),
+            false
+        ));
         // Asymmetric, but nothing else receives game traffic.
         let asym = cd(reported, 2.0, 33.0, true, true);
         let quiet = cd(ep(16, 50000), 1.0, 0.5, false, true);
-        assert!(!pattern(reported, &[asym, quiet], &HashSet::new()));
+        assert!(!pattern(reported, &[asym, quiet], &HashSet::new(), false));
         // The busy endpoint is another peer's, or the STUN server port.
         let other = ep(16, 50001);
         let claimed: HashSet<_> = [other].into();
         assert!(!pattern(
             reported,
             &[asym, cd(other, 20.0, 2.0, false, true)],
-            &claimed
+            &claimed,
+            false
         ));
         let stun = cd(ep(16, STUN_SERVER_PORT), 20.0, 2.0, false, true);
-        assert!(!pattern(reported, &[asym, stun], &HashSet::new()));
+        assert!(!pattern(reported, &[asym, stun], &HashSet::new(), false));
         // Steam's remote carries no traffic at all (E1 mode): not P's case.
-        assert!(!pattern(reported, &[busy_other], &HashSet::new()));
+        assert!(!pattern(reported, &[busy_other], &HashSet::new(), false));
+    }
+
+    #[test]
+    fn pattern_ignores_non_relay_inbound_and_other_relayed_peers() {
+        // Online run 1: a direct internet peer's inbound dipped below 5/s
+        // while another peer's stream (not a relay address) ran at 160/s.
+        let reported = ep(68, 36149);
+        let dipped = cd(reported, 5.0, 24.0, true, false);
+        let stream = cd(ep(9, 59401), 160.0, 2.0, false, false);
+        assert!(!pattern(
+            reported,
+            &[dipped, stream],
+            &HashSet::new(),
+            false
+        ));
+        // The shared nearby relay carries other relayed peers' streams.
+        let shared = cd(ep(148, 4380), 40.0, 2.0, false, true);
+        assert!(pattern(reported, &[dipped, shared], &HashSet::new(), false));
+        assert!(!pattern(reported, &[dipped, shared], &HashSet::new(), true));
     }
 
     #[test]
@@ -532,15 +591,15 @@ mod tests {
             cd(reported, 2.0, 34.0, true, false),
             cd(lan(49909), 15.0, 1.0, true, false),
         ];
-        assert!(!pattern(reported, &cands, &HashSet::new()));
+        assert!(!pattern(reported, &cands, &HashSet::new(), false));
 
-        // The same traffic on public addresses would still fire P.
+        // On public addresses neither: the sibling port isn't a relay address.
         let reported = ep(15, 49908);
         let cands = [
             cd(reported, 2.0, 34.0, true, false),
             cd(ep(15, 49909), 15.0, 1.0, true, false),
         ];
-        assert!(pattern(reported, &cands, &HashSet::new()));
+        assert!(!pattern(reported, &cands, &HashSet::new(), false));
     }
 
     #[test]
@@ -585,13 +644,27 @@ mod tests {
     }
 
     #[test]
-    fn relay_set_includes_unlisted_inbound_and_e1_pick() {
-        // Not in any list, but receiving the inbound game traffic.
-        let unlisted = cd(ep(50, 3000), 20.0, 2.0, false, false);
+    fn relay_set_skips_another_sessions_check_endpoint() {
+        // Online run 1: while another relayed peer joined, its own check
+        // endpoint (stun-like, on a different relay) was attributed here.
+        let reported = ep(196, 4379);
+        let cands = [
+            cd(reported, 2.0, 50.0, true, true),
+            cd(ep(6, 4379), 2.0, 48.0, true, true), // another peer's checks
+            cd(ep(148, 4380), 25.0, 2.0, false, true), // wrapped inbound
+        ];
         assert_eq!(
-            relay_set(&[unlisted], None, &HashSet::new(), &[], None),
-            vec![ep(50, 3000)]
+            relay_set(&cands, Some(reported), &HashSet::new(), &[], None),
+            vec![ep(148, 4380)]
         );
+    }
+
+    #[test]
+    fn relay_set_skips_unlisted_inbound_and_keeps_e1_pick() {
+        // Not a relay address, though receiving game-rate traffic: online,
+        // that was another player's direct endpoint (run 1).
+        let unlisted = cd(ep(50, 3000), 20.0, 2.0, false, false);
+        assert!(relay_set(&[unlisted], None, &HashSet::new(), &[], None).is_empty());
         // Listed but too slow, and not previously attributed: left out.
         let slow = cd(ep(51, 4380), 1.0, 1.0, false, true);
         assert!(relay_set(&[slow], None, &HashSet::new(), &[], None).is_empty());

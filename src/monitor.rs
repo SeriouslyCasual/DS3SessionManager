@@ -941,8 +941,26 @@ fn update_relays(
         })
         .collect();
 
-    // 1. Evidence.
+    // 1. Evidence. Detector P also excludes endpoints already attributed to
+    // other peers, and stays silent while another live peer is relayed by
+    // Steam's flag or a relay-address remote (see `relay::pattern`).
+    let attributed: Vec<(SteamId, Vec<SocketAddrV4>)> = peers
+        .iter()
+        .map(|(o, v)| (*o, v.relay_eps.clone()))
+        .collect();
+    let relayed_by_other_signals: HashSet<SteamId> = active
+        .iter()
+        .filter(|(_, st)| st.using_relay || st.remote.is_some_and(|r| relay_addr(*r.ip())))
+        .map(|(id, _)| *id)
+        .collect();
     for (id, st) in active {
+        let mut p_claimed = others(id);
+        for (o, eps) in &attributed {
+            if o != id {
+                p_claimed.extend(eps.iter().copied());
+            }
+        }
+        let others_relayed = relayed_by_other_signals.iter().any(|o| o != id);
         let Some(view) = peers.get_mut(id) else {
             continue;
         };
@@ -951,7 +969,7 @@ fn update_relays(
             flag: st.using_relay,
             pattern: st
                 .remote
-                .is_some_and(|r| relay::pattern(r, &candidates, &others(id))),
+                .is_some_and(|r| relay::pattern(r, &candidates, &p_claimed, others_relayed)),
             asn: ctx.asn.map(|db| {
                 ip.and_then(|ip| db.lookup(IpAddr::V4(ip)))
                     .is_some_and(|(n, _)| n == VALVE_ASN)
