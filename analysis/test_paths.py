@@ -3,6 +3,7 @@
 Run from the repo root:  python -I analysis/test_paths.py
 """
 
+import dataclasses
 import os
 import sqlite3
 import sys
@@ -157,6 +158,13 @@ class Episodes(unittest.TestCase):
         self.assertAlmostEqual(cost[0]["relay_minus_direct_rtt"], 22.0 - 1.05)  # direct: median of 1.1 and 1.0
         self.assertAlmostEqual(cost[0]["tcp_minus_direct_rtt"], 40.0 - 1.05)
         self.assertEqual(cost[0]["direct"]["episodes"], 2)
+        # One block per run file: unpooled, no run has two path kinds; pooled, the peer pairs up.
+        split = [dataclasses.replace(e, run=f"block{i}") for i, e in enumerate(eps)]
+        self.assertEqual(paths.relay_cost(split, 10), [])
+        pooled = paths.relay_cost(split, 10, pool_runs=True)
+        self.assertEqual(len(pooled), 1)
+        self.assertEqual(pooled[0]["run"], "pooled")
+        self.assertAlmostEqual(pooled[0]["relay_minus_direct_rtt"], 22.0 - 1.05)
         # LAN peers never enter E5.
         self.assertEqual(paths.inflation(eps, {}, None, 10), [])
 

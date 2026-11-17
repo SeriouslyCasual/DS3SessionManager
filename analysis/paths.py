@@ -364,12 +364,17 @@ def load_run(path: str, settle_ns: int) -> tuple[str, list[Episode], dict[int, d
 # ---------------------------------------------------------------- E4 and E5
 
 
-def relay_cost(eps: list[Episode], min_samples: int) -> list[dict]:
-    """Per (run, peer) seen on two or more path kinds: each kind's median RTT and jitter."""
+def relay_cost(eps: list[Episode], min_samples: int, pool_runs: bool = False) -> list[dict]:
+    """Per (run, peer) seen on two or more path kinds: each kind's median RTT and jitter.
+
+    With pool_runs, a peer's episodes from all runs are grouped together (run "pooled"):
+    for controlled runs split into one run file per block, since ds3sm stops when the game exits.
+    """
     groups: dict[tuple[str, int], dict[str, list[Episode]]] = {}
     for e in eps:
         if e.stats.get("n_rtt", 0) >= min_samples:
-            groups.setdefault((e.run, e.peer), {}).setdefault(e.path, []).append(e)
+            key = ("pooled" if pool_runs else e.run, e.peer)
+            groups.setdefault(key, {}).setdefault(e.path, []).append(e)
     out = []
     for (run, peer), by in groups.items():
         if len(by) < 2:
@@ -482,6 +487,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--home-lon", type=float)
     ap.add_argument("--salt", help="pseudonym salt (default: random per invocation)")
     ap.add_argument("--json", help="write the full result (pseudonymised) to this file")
+    ap.add_argument("--pool-runs", action="store_true",
+                    help="E4: group a peer's episodes across all runs (one run file per block)")
     a = ap.parse_args(argv)
     if (a.home_lat is None) != (a.home_lon is None):
         ap.error("--home-lat and --home-lon go together")
@@ -497,7 +504,7 @@ def main(argv: list[str] | None = None) -> int:
         eps += e
         geo.update({(run, sid): v for sid, v in g.items()})
     home = (a.home_lat, a.home_lon) if a.home_lat is not None else None
-    cost = relay_cost(eps, a.min_samples)
+    cost = relay_cost(eps, a.min_samples, a.pool_runs)
     infl = inflation(eps, geo, home, a.min_samples)
     print_report(eps, cost, infl, name)
     if a.json:
